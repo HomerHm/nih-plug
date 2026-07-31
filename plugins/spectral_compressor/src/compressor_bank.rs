@@ -124,40 +124,21 @@ pub struct ThresholdParams {
     /// The center frqeuency for the target curve when sidechaining is not enabled. The curve is a
     /// polynomial `threshold_db + curve_slope*x + curve_curve*(x^2)` that evaluates to a decibel
     /// value, where `x = ln(center_frequency) - ln(bin_frequency)`. In other words, this is
-    /// evaluated in the log/log domain for decibels and octaves.
+    /// evaluated in the log/log domain for decibels and octaves. The slope and curve coefficients
+    /// live on each [`CompressorParams`] so the two directions can have different curve shapes
+    /// while still pivoting around a shared center frequency.
     #[id = "thresh_center_freq"]
     pub center_frequency: FloatParam,
-    /// The slope for the curve, in the log/log domain. See the polynomial above.
-    #[id = "thresh_curve_slope"]
-    pub curve_slope: FloatParam,
-    /// The, uh, 'curve' for the curve, in the logarithmic domain. This is the third coefficient in
-    /// the quadratic polynomial and controls the parabolic behavior. Positive values turn the curve
-    /// into a v-shaped curve, while negative values attenuate everything outside of the center
-    /// frequency. See the polynomial above.
-    #[id = "thresh_curve_curve"]
-    pub curve_curve: FloatParam,
 
-    /// When enabled, the upwards compressors use the exact same curve shape as the downwards
-    /// compressors. This is how Spectral Compressor has always behaved, so it defaults to enabled
-    /// and old presets keep sounding the same. Disabling it makes the three `upwards_*` parameters
-    /// below take over for the upwards compressors.
+    /// Mirrors the slope and curve values between the upwards and downwards compressors while
+    /// enabled.
     ///
-    /// Note that this only splits the *shape* of the curve. Its vertical position is already
-    /// separately controllable through each compressor's own `threshold_offset_db`.
-    #[id = "thresh_up_link"]
-    pub upwards_curve_link: BoolParam,
-    /// [`Self::center_frequency`], but for the upwards compressors. Only has an effect when
-    /// [`Self::upwards_curve_link`] is disabled.
-    #[id = "thresh_up_center"]
-    pub upwards_center_frequency: FloatParam,
-    /// [`Self::curve_slope`], but for the upwards compressors. Only has an effect when
-    /// [`Self::upwards_curve_link`] is disabled.
-    #[id = "thresh_up_slope"]
-    pub upwards_curve_slope: FloatParam,
-    /// [`Self::curve_curve`], but for the upwards compressors. Only has an effect when
-    /// [`Self::upwards_curve_link`] is disabled.
-    #[id = "thresh_up_curve"]
-    pub upwards_curve_curve: FloatParam,
+    /// The mirroring deliberately happens in the editor rather than in the DSP: each compressor
+    /// always reads its own slope and curve, and the editor copies one side's gestures onto the
+    /// other. That keeps this file free of any link special-casing, and it means both sliders
+    /// visibly show the same number instead of one silently shadowing the other.
+    #[id = "thresh_link"]
+    pub slope_curve_link: BoolParam,
 
     /// Controls the type of threshold that should be used. Check [`ThresholdMode`] for more
     /// information.
@@ -209,6 +190,16 @@ pub struct CompressorBankParams {
 /// Both versions will have a parameter ID and a parameter name prefix to distinguish them.
 #[derive(Params)]
 pub struct CompressorParams {
+    /// The slope for this compressor's threshold curve, in the log/log domain. See
+    /// [`ThresholdParams::center_frequency`] for the full polynomial.
+    #[id = "curve_slope"]
+    pub curve_slope: FloatParam,
+    /// The, uh, 'curve' for this compressor's threshold curve, in the logarithmic domain. This is
+    /// the third coefficient in the quadratic polynomial and controls the parabolic behavior.
+    /// Positive values turn the curve into a v-shaped curve, while negative values attenuate
+    /// everything outside of the center frequency.
+    #[id = "curve_curve"]
+    pub curve_curve: FloatParam,
     /// The compression threshold relative to the target curve.
     #[id = "threshold_offset"]
     pub threshold_offset_db: FloatParam,
@@ -247,19 +238,6 @@ impl ThresholdParams {
             should_update_downwards_knee_parabolas.store(true, Ordering::SeqCst);
             should_update_upwards_knee_parabolas.store(true, Ordering::SeqCst);
         });
-        // The upwards-only curve parameters cannot affect the downwards compressors, so they only
-        // need to dirty the upwards arrays. The shared parameters above still have to dirty both
-        // because the upwards curve follows them whenever `upwards_curve_link` is enabled.
-        let set_update_upwards_thresholds: Arc<dyn Fn(f32) + Send + Sync> = Arc::new({
-            let should_update_upwards_thresholds =
-                compressor_bank.should_update_upwards_thresholds.clone();
-            let should_update_upwards_knee_parabolas =
-                compressor_bank.should_update_upwards_knee_parabolas.clone();
-            move |_| {
-                should_update_upwards_thresholds.store(true, Ordering::SeqCst);
-                should_update_upwards_knee_parabolas.store(true, Ordering::SeqCst);
-            }
-        });
 
         ThresholdParams {
             threshold_db: FloatParam::new(
@@ -286,77 +264,12 @@ impl ThresholdParams {
             // This includes the unit
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
             .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
-            // These are polynomial coefficients that are evaluated in the log/log domain
-            // (octaves/decibels). The global threshold is the intercept.
-            curve_slope: FloatParam::new(
-                "Threshold Slope",
-                0.0,
-                FloatRange::SymmetricalSkewed {
-                    min: -36.0,
-                    max: 36.0,
-                    factor: FloatRange::skew_factor(-2.0),
-                    center: 0.0,
-                },
-            )
-            .with_callback(set_update_both_thresholds.clone())
-            .with_unit(" dB/oct")
-            .with_step_size(0.01),
-            curve_curve: FloatParam::new(
-                "Threshold Curve",
-                0.0,
-                FloatRange::SymmetricalSkewed {
-                    min: -24.0,
-                    max: 24.0,
-                    factor: FloatRange::skew_factor(-2.0),
-                    center: 0.0,
-                },
-            )
-            .with_callback(set_update_both_thresholds.clone())
-            .with_unit(" dB/oct²")
-            .with_step_size(0.01),
 
-            upwards_curve_link: BoolParam::new("Upwards Link", true).with_callback({
-                let set_update_upwards_thresholds = set_update_upwards_thresholds.clone();
-                Arc::new(move |_| set_update_upwards_thresholds(0.0))
-            }),
-            upwards_center_frequency: FloatParam::new(
-                "Upwards Center",
-                420.0,
-                FloatRange::Skewed {
-                    min: 20.0,
-                    max: 20_000.0,
-                    factor: FloatRange::skew_factor(-2.0),
-                },
-            )
-            .with_callback(set_update_upwards_thresholds.clone())
-            .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
-            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
-            upwards_curve_slope: FloatParam::new(
-                "Upwards Slope",
-                0.0,
-                FloatRange::SymmetricalSkewed {
-                    min: -36.0,
-                    max: 36.0,
-                    factor: FloatRange::skew_factor(-2.0),
-                    center: 0.0,
-                },
-            )
-            .with_callback(set_update_upwards_thresholds.clone())
-            .with_unit(" dB/oct")
-            .with_step_size(0.01),
-            upwards_curve_curve: FloatParam::new(
-                "Upwards Curve",
-                0.0,
-                FloatRange::SymmetricalSkewed {
-                    min: -24.0,
-                    max: 24.0,
-                    factor: FloatRange::skew_factor(-2.0),
-                    center: 0.0,
-                },
-            )
-            .with_callback(set_update_upwards_thresholds)
-            .with_unit(" dB/oct²")
-            .with_step_size(0.01),
+            // Purely an editor concern, so it needs no callback: the DSP always reads each
+            // compressor's own slope and curve regardless of this value. The editor draws this
+            // above the two compressor columns instead of in the threshold column, so it's hidden
+            // from the generic UI to avoid showing up twice.
+            slope_curve_link: BoolParam::new("Slope/Curve Link", true).hide_in_generic_ui(),
 
             mode: EnumParam::new("Mode", ThresholdMode::Internal)
                 // Not the most efficient way to do this, but it's a bit cleaner than the
@@ -373,45 +286,23 @@ impl ThresholdParams {
         }
     }
 
-    /// Build the [`CurveParams`] used by the downwards compressors.
-    pub fn downwards_curve_params(&self) -> CurveParams {
-        self.build_curve_params(
-            self.center_frequency.value(),
-            self.curve_slope.value(),
-            self.curve_curve.value(),
-        )
-    }
-
-    /// Build the [`CurveParams`] used by the upwards compressors. When
-    /// [`Self::upwards_curve_link`] is enabled this is the exact same curve as
-    /// [`Self::downwards_curve_params()`], which is how Spectral Compressor behaved before the two
-    /// curves could be split.
-    pub fn upwards_curve_params(&self) -> CurveParams {
-        if self.upwards_curve_link.value() {
-            self.downwards_curve_params()
-        } else {
-            self.build_curve_params(
-                self.upwards_center_frequency.value(),
-                self.upwards_curve_slope.value(),
-                self.upwards_curve_curve.value(),
-            )
-        }
-    }
-
-    /// Shared by both curve builders above. Only the three shape values differ between them; the
-    /// intercept and the sidechain-dependent slope correction are always the same.
-    fn build_curve_params(&self, center_frequency: f32, slope: f32, curve: f32) -> CurveParams {
+    /// Build the [`CurveParams`] for one compressor direction. The intercept and center frequency
+    /// are shared between the two directions, while the shape comes from that direction's own
+    /// slope and curve parameters.
+    pub fn curve_params(&self, compressor: &CompressorParams) -> CurveParams {
         CurveParams {
             intercept: self.threshold_db.value(),
-            center_frequency,
+            center_frequency: self.center_frequency.value(),
             // The cheeky 3 additional dB/octave attenuation is to match pink noise with the
             // default settings. When using sidechaining we explicitly don't want this because
             // the curve should be a flat offset to the sidechain input at the default settings.
             slope: match self.mode.value() {
-                ThresholdMode::Internal => slope - 3.0,
-                ThresholdMode::SidechainMatch | ThresholdMode::SidechainCompress => slope,
+                ThresholdMode::Internal => compressor.curve_slope.value() - 3.0,
+                ThresholdMode::SidechainMatch | ThresholdMode::SidechainCompress => {
+                    compressor.curve_slope.value()
+                }
             },
-            curve,
+            curve: compressor.curve_curve.value(),
         }
     }
 }
@@ -467,6 +358,34 @@ impl CompressorParams {
         });
 
         CompressorParams {
+            // These are polynomial coefficients that are evaluated in the log/log domain
+            // (octaves/decibels). `ThresholdParams::threshold_db` is the intercept.
+            curve_slope: FloatParam::new(
+                format!("{name_prefix} Slope"),
+                0.0,
+                FloatRange::SymmetricalSkewed {
+                    min: -36.0,
+                    max: 36.0,
+                    factor: FloatRange::skew_factor(-2.0),
+                    center: 0.0,
+                },
+            )
+            .with_callback(set_update_thresholds.clone())
+            .with_unit(" dB/oct")
+            .with_step_size(0.01),
+            curve_curve: FloatParam::new(
+                format!("{name_prefix} Curve"),
+                0.0,
+                FloatRange::SymmetricalSkewed {
+                    min: -24.0,
+                    max: 24.0,
+                    factor: FloatRange::skew_factor(-2.0),
+                    center: 0.0,
+                },
+            )
+            .with_callback(set_update_thresholds.clone())
+            .with_unit(" dB/oct²")
+            .with_step_size(0.01),
             // TODO: Set nicer default values for these things
             // As explained above, these offsets are relative to the target curve
             threshold_offset_db: FloatParam::new(
@@ -733,8 +652,10 @@ impl CompressorBank {
             let analyzer_input_data = self.analyzer_input_data.input_buffer();
 
             // The editor needs to know about this too so it can draw the spectra correctly
-            analyzer_input_data.downwards_curve_params = params.threshold.downwards_curve_params();
-            analyzer_input_data.upwards_curve_params = params.threshold.upwards_curve_params();
+            analyzer_input_data.downwards_curve_params =
+                params.threshold.curve_params(&params.compressors.downwards);
+            analyzer_input_data.upwards_curve_params =
+                params.threshold.curve_params(&params.compressors.upwards);
             analyzer_input_data.curve_offsets_db = (
                 params.compressors.upwards.threshold_offset_db.value(),
                 params.compressors.downwards.threshold_offset_db.value(),
@@ -1158,7 +1079,7 @@ impl CompressorBank {
             .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            let curve_params = params.threshold.downwards_curve_params();
+            let curve_params = params.threshold.curve_params(&params.compressors.downwards);
             let curve = Curve::new(&curve_params);
 
             let downwards_intercept = params.compressors.downwards.threshold_offset_db.value();
@@ -1176,8 +1097,7 @@ impl CompressorBank {
             .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            // This is the same curve as above whenever the two are linked
-            let curve_params = params.threshold.upwards_curve_params();
+            let curve_params = params.threshold.curve_params(&params.compressors.upwards);
             let curve = Curve::new(&curve_params);
 
             let upwards_intercept = params.compressors.upwards.threshold_offset_db.value();

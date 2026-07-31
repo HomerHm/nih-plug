@@ -22,10 +22,12 @@ use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use std::sync::{Arc, Mutex};
 
 use self::analyzer::Analyzer;
+use self::param_link::{param_ptr_by_id, ParamLink};
 use crate::analyzer::AnalyzerData;
 use crate::{SpectralCompressor, SpectralCompressorParams};
 
 mod analyzer;
+mod param_link;
 
 /// The GUI's width, in logical pixels. Wide enough for the four control columns below the
 /// analyzer to sit side by side.
@@ -145,43 +147,9 @@ fn controls(cx: &mut Context) {
             GenericUi::new(cx, Data::params.map(|p| p.threshold.clone()));
         });
 
-        make_column(cx, "Upwards", |cx| {
-            // We don't want to show the 'Upwards' prefix here, but it should still be in
-            // the parameter name so the parameter list makes sense
-            let upwards_compressor_params = Data::params.map(|p| p.compressors.upwards.clone());
-            GenericUi::new_custom(cx, upwards_compressor_params, |cx, param_ptr| {
-                HStack::new(cx, |cx| {
-                    Label::new(
-                        cx,
-                        unsafe { param_ptr.name() }
-                            .strip_prefix("Upwards ")
-                            .expect("Expected parameter name prefix, this is a bug"),
-                    )
-                    .class("label");
-
-                    GenericUi::draw_widget(cx, upwards_compressor_params, param_ptr);
-                })
-                .class("row");
-            });
-        });
-
-        make_column(cx, "Downwards", |cx| {
-            let downwards_compressor_params = Data::params.map(|p| p.compressors.downwards.clone());
-            GenericUi::new_custom(cx, downwards_compressor_params, |cx, param_ptr| {
-                HStack::new(cx, |cx| {
-                    Label::new(
-                        cx,
-                        unsafe { param_ptr.name() }
-                            .strip_prefix("Downwards ")
-                            .expect("Expected parameter name prefix, this is a bug"),
-                    )
-                    .class("label");
-
-                    GenericUi::draw_widget(cx, downwards_compressor_params, param_ptr);
-                })
-                .class("row");
-            });
-        });
+        // The two compressor columns own the slope and curve of their own threshold curve, so the
+        // toggle that links those sits directly above the pair rather than off in another column
+        compressor_columns(cx);
     })
     // Auto means this row is exactly as tall as its tallest column, so adding parameters makes
     // the window's analyzer shrink rather than pushing controls out of view
@@ -189,6 +157,77 @@ fn controls(cx: &mut Context) {
     .bottom(Pixels(12.0))
     .child_left(Stretch(1.0))
     .child_right(Stretch(1.0));
+}
+
+/// The Upwards and Downwards columns, wrapped in the view that keeps their slope and curve values
+/// in lockstep while the link is enabled.
+fn compressor_columns(cx: &mut Context) {
+    let params = Data::params.get(cx);
+
+    // These IDs are the ones declared on `CompressorParams`; the `upwards`/`downwards` prefixes
+    // are added a level up and are not part of them
+    let pairs = vec![
+        (
+            param_ptr_by_id(&params.compressors.upwards, "curve_slope"),
+            param_ptr_by_id(&params.compressors.downwards, "curve_slope"),
+        ),
+        (
+            param_ptr_by_id(&params.compressors.upwards, "curve_curve"),
+            param_ptr_by_id(&params.compressors.downwards, "curve_curve"),
+        ),
+    ];
+
+    let is_linked = {
+        let params = params.clone();
+        move || params.threshold.slope_curve_link.value()
+    };
+
+    VStack::new(cx, |cx| {
+        ParamButton::new(cx, Data::params, |p| &p.threshold.slope_curve_link)
+            .with_label("Slope/Curve Link")
+            .left(Stretch(1.0))
+            .right(Stretch(1.0))
+            .bottom(Pixels(4.0));
+
+        ParamLink::new(cx, is_linked, pairs, |cx| {
+            HStack::new(cx, |cx| {
+                compressor_column(cx, "Upwards");
+                compressor_column(cx, "Downwards");
+            })
+            .height(Auto);
+        })
+        .height(Auto);
+    })
+    .width(Pixels(660.0))
+    .height(Auto);
+}
+
+/// One compressor's column. `direction` is both the heading and the parameter name prefix that
+/// gets stripped from each row's label.
+fn compressor_column(cx: &mut Context, direction: &'static str) {
+    make_column(cx, direction, move |cx| {
+        // We don't want to show the 'Upwards'/'Downwards' prefix here, but it should still be in
+        // the parameter name so the parameter list makes sense
+        let compressor_params = Data::params.map(move |p| match direction {
+            "Upwards" => p.compressors.upwards.clone(),
+            _ => p.compressors.downwards.clone(),
+        });
+        let strip_prefix = format!("{direction} ");
+        GenericUi::new_custom(cx, compressor_params, move |cx, param_ptr| {
+            HStack::new(cx, |cx| {
+                Label::new(
+                    cx,
+                    unsafe { param_ptr.name() }
+                        .strip_prefix(&strip_prefix)
+                        .expect("Expected parameter name prefix, this is a bug"),
+                )
+                .class("label");
+
+                GenericUi::draw_widget(cx, compressor_params, param_ptr);
+            })
+            .class("row");
+        });
+    });
 }
 
 fn make_column(cx: &mut Context, title: &str, contents: impl FnOnce(&mut Context)) {
