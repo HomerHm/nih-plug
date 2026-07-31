@@ -5346,7 +5346,7 @@ dependencies = [
 
 [[package]]
 name = "spectral_compressor"
-version = "0.4.3-hm.6"
+version = "0.4.3-hm.7"
 dependencies = [
  "atomic_float",
  "crossbeam",

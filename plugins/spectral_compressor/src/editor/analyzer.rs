@@ -21,9 +21,13 @@ use nih_plug_vizia::vizia::vg;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use super::EditedDirection;
 use crate::analyzer::AnalyzerData;
 use crate::curve::{Curve, CurveParams};
-use crate::eq_curve::{EqCurve, EqCurveParams, EqNodeType};
+use crate::eq_curve::{EqBankParams, EqCurve, EqCurveParams, EqNodeType};
+use crate::SpectralCompressorParams;
+use nih_plug::prelude::{Enum, Param, ParamPtr};
+use nih_plug_vizia::widgets::RawParamEvent;
 
 // We'll show the bins from 30 Hz (to your chest) to 22 kHz, scaled logarithmically
 #[allow(unused)]
@@ -34,9 +38,18 @@ const LN_FREQ_RANGE_START_HZ: f32 = 3.4011974; // 30.0f32.ln();
 const LN_FREQ_RANGE_END_HZ: f32 = 9.998797; // 22_000.0f32.ln();
 const LN_FREQ_RANGE: f32 = LN_FREQ_RANGE_END_HZ - LN_FREQ_RANGE_START_HZ;
 
-/// The frequencies that get a gridline and a label underneath the analyzer.
+/// The frequencies that get a labelled gridline underneath the analyzer.
 pub(crate) const FREQUENCY_TICKS: &[f32] = &[
     50.0, 100.0, 200.0, 500.0, 1_000.0, 2_000.0, 5_000.0, 10_000.0, 20_000.0,
+];
+
+/// Unlabelled gridlines, drawn dimmer than the labelled ones. Ten to a decade below 1 kHz and
+/// every kilohertz above it, which stays readable once the logarithmic scale squeezes the top end.
+const MINOR_FREQUENCY_TICKS: &[f32] = &[
+    30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0,
+    800.0, 900.0, 1_000.0, 2_000.0, 3_000.0, 4_000.0, 5_000.0, 6_000.0, 7_000.0, 8_000.0, 9_000.0,
+    10_000.0, 11_000.0, 12_000.0, 13_000.0, 14_000.0, 15_000.0, 16_000.0, 17_000.0, 18_000.0,
+    19_000.0, 20_000.0,
 ];
 
 /// The decibel values that get a horizontal gridline. These are thresholds, not signal levels.
@@ -59,11 +72,25 @@ pub(crate) fn format_frequency(frequency: f32) -> String {
     }
 }
 
-/// The color of the gridlines. Kept dim so the spectrum stays the thing you look at.
+/// The color of the labelled gridlines. Kept dim so the spectrum stays the thing you look at.
 const GRID_COLOR: vg::Color = vg::Color::rgbaf(0.35, 0.35, 0.35, 0.35);
+/// The unlabelled gridlines are dimmer still, so they read as subdivisions rather than competing
+/// with the frequencies that have a number underneath them.
+const MINOR_GRID_COLOR: vg::Color = vg::Color::rgbaf(0.35, 0.35, 0.35, 0.15);
 
 /// The radius of a node's handle, in logical pixels.
 const NODE_RADIUS: f32 = 5.0;
+
+/// The decibel span the analyzer covers vertically, matching `db_to_unclamped_t`.
+const DB_RANGE: f32 = 100.0;
+
+/// How far one scroll wheel notch moves a node's Q. Multiplicative so the steps feel even across
+/// the parameter's skewed range.
+const SCROLL_Q_FACTOR: f32 = 1.15;
+
+/// How much of its opacity the curve that isn't being edited keeps. Dimming it makes it obvious
+/// which curve a click will act on, since only the edited one responds to the mouse.
+const UNSELECTED_CURVE_OPACITY: f32 = 0.3;
 
 /// The color used for drawing the overlay. Currently not configurable using the style sheet (that
 /// would be possible by moving this to a dedicated view and overlaying that).
@@ -83,25 +110,54 @@ const UPWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.55, 0.70, 0.
 
 /// A very analyzer showing the envelope followers as a magnitude spectrum with an overlay for the
 /// gain reduction.
-pub struct Analyzer {
+pub struct Analyzer<L> {
     analyzer_data: Arc<Mutex<triple_buffer::Output<AnalyzerData>>>,
     sample_rate: Arc<AtomicF32>,
+    /// Which compressor's curve the mouse acts on. Read during both drawing and event handling,
+    /// so it's kept as a live lens rather than a value copied at build time.
+    edited_direction: L,
+    /// The parameters, needed to read node values back and to write edits to them.
+    params: Arc<SpectralCompressorParams>,
+    /// Set for the duration of a drag.
+    drag: Option<NodeDrag>,
 }
 
-impl Analyzer {
+/// A node handle being dragged.
+///
+/// The node's values are recorded when the drag starts and the pointer's movement is applied as a
+/// delta, so grabbing a handle slightly off-center moves it smoothly instead of snapping it under
+/// the cursor.
+struct NodeDrag {
+    node_index: usize,
+    direction: EditedDirection,
+    start_frequency: f32,
+    start_gain_db: f32,
+    start_cursor: (f32, f32),
+}
+
+impl<L> Analyzer<L>
+where
+    L: Lens<Target = EditedDirection>,
+{
     /// Creates a new [`Analyzer`].
-    pub fn new<LAnalyzerData, LRate>(
+    pub fn new<LAnalyzerData, LRate, LParams>(
         cx: &mut Context,
         analyzer_data: LAnalyzerData,
         sample_rate: LRate,
-    ) -> Handle<Self>
+        params: LParams,
+        edited_direction: L,
+    ) -> Handle<'_, Self>
     where
         LAnalyzerData: Lens<Target = Arc<Mutex<triple_buffer::Output<AnalyzerData>>>>,
         LRate: Lens<Target = Arc<AtomicF32>>,
+        LParams: Lens<Target = Arc<SpectralCompressorParams>>,
     {
         Self {
             analyzer_data: analyzer_data.get(cx),
             sample_rate: sample_rate.get(cx),
+            params: params.get(cx),
+            edited_direction,
+            drag: None,
         }
         .build(
             cx,
@@ -109,11 +165,212 @@ impl Analyzer {
             |_cx| (),
         )
     }
+
+    /// The bank of nodes belonging to `direction`.
+    fn nodes(&self, direction: EditedDirection) -> &EqBankParams {
+        match direction {
+            EditedDirection::Upwards => &self.params.compressors.upwards.eq,
+            EditedDirection::Downwards => &self.params.compressors.downwards.eq,
+        }
+    }
+
+    /// Where a node's handle is drawn, as `[0, 1]` fractions of the analyzer's bounds. Mirrors
+    /// what [`draw_nodes()`] does, so hit testing and drawing cannot disagree.
+    fn node_position_t(&self, direction: EditedDirection, node_index: usize) -> (f32, f32) {
+        let compressor = match direction {
+            EditedDirection::Upwards => &self.params.compressors.upwards,
+            EditedDirection::Downwards => &self.params.compressors.downwards,
+        };
+        let node = compressor.eq.nodes[node_index].snapshot();
+
+        let curve_params = self.params.threshold.curve_params(compressor);
+        let curve = Curve::new(&curve_params);
+        let eq_curve = EqCurve::new(&compressor.eq.snapshot());
+
+        let y_db = curve.evaluate_ln(node.center_frequency.ln())
+            + eq_curve.evaluate_db(node.center_frequency)
+            + compressor.threshold_offset_db.value();
+
+        (
+            frequency_to_t(node.center_frequency),
+            1.0 - db_to_unclamped_t(y_db),
+        )
+    }
+
+    /// The active node whose handle is under `(x, y)`, if any.
+    fn node_at(
+        &self,
+        cx: &EventContext,
+        direction: EditedDirection,
+        x: f32,
+        y: f32,
+    ) -> Option<usize> {
+        let bounds = cx.bounds();
+        let radius = NODE_RADIUS * cx.scale_factor() * 2.0;
+
+        let mut closest: Option<(usize, f32)> = None;
+        for (index, node) in self.nodes(direction).nodes.iter().enumerate() {
+            if node.node_type.value() == EqNodeType::Off {
+                continue;
+            }
+
+            let (t_x, t_y) = self.node_position_t(direction, index);
+            let dx = (bounds.x + (bounds.w * t_x)) - x;
+            let dy = (bounds.y + (bounds.h * t_y)) - y;
+            let distance_squared = (dx * dx) + (dy * dy);
+            if distance_squared > radius * radius {
+                continue;
+            }
+
+            if closest.is_none_or(|(_, best)| distance_squared < best) {
+                closest = Some((index, distance_squared));
+            }
+        }
+
+        closest.map(|(index, _)| index)
+    }
+
+    /// The first switched-off node, which is the one a double click turns on.
+    fn first_free_node(&self, direction: EditedDirection) -> Option<usize> {
+        self.nodes(direction)
+            .nodes
+            .iter()
+            .position(|node| node.node_type.value() == EqNodeType::Off)
+    }
 }
 
-impl View for Analyzer {
+/// Set a parameter as a complete one-off gesture.
+///
+/// These are the same events a slider emits, so edits made on the graph are mirrored by the link
+/// views and recorded by the host exactly like edits made with the sliders.
+fn set_param(cx: &mut EventContext, param_ptr: ParamPtr, plain_value: f32) {
+    // SAFETY: The pointer comes from the params object owned by the editor's data, which outlives
+    //         this view.
+    let normalized = unsafe { param_ptr.preview_normalized(plain_value) };
+
+    cx.emit(RawParamEvent::BeginSetParameter(param_ptr));
+    cx.emit(RawParamEvent::SetParameterNormalized(param_ptr, normalized));
+    cx.emit(RawParamEvent::EndSetParameter(param_ptr));
+}
+
+impl<L> View for Analyzer<L>
+where
+    L: 'static + Lens<Target = EditedDirection>,
+{
     fn element(&self) -> Option<&'static str> {
         Some("analyzer")
+    }
+
+    fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        let direction = self.edited_direction.get(cx);
+
+        event.map(|window_event, meta| match window_event {
+            WindowEvent::MouseDown(MouseButton::Left) => {
+                let (x, y) = (cx.mouse().cursorx, cx.mouse().cursory);
+                if let Some(node_index) = self.node_at(cx, direction, x, y) {
+                    let node = self.nodes(direction).nodes[node_index].snapshot();
+                    self.drag = Some(NodeDrag {
+                        node_index,
+                        direction,
+                        start_frequency: node.center_frequency,
+                        start_gain_db: node.gain_db,
+                        start_cursor: (x, y),
+                    });
+
+                    cx.capture();
+                    cx.set_active(true);
+                    meta.consume();
+                }
+            }
+            WindowEvent::MouseUp(MouseButton::Left) => {
+                if self.drag.take().is_some() {
+                    cx.release();
+                    cx.set_active(false);
+                    meta.consume();
+                }
+            }
+            WindowEvent::MouseMove(x, y) => {
+                let Some(drag) = &self.drag else {
+                    return;
+                };
+
+                let bounds = cx.bounds();
+                if bounds.w <= 0.0 || bounds.h <= 0.0 {
+                    return;
+                }
+
+                // Horizontal movement is a shift along the logarithmic frequency axis, vertical
+                // movement a shift in decibels. Both are relative to where the drag started.
+                let ln_frequency = drag.start_frequency.ln()
+                    + (((x - drag.start_cursor.0) / bounds.w) * LN_FREQ_RANGE);
+                let gain_db =
+                    drag.start_gain_db - (((y - drag.start_cursor.1) / bounds.h) * DB_RANGE);
+
+                let node = &self.nodes(drag.direction).nodes[drag.node_index];
+                set_param(cx, param_ptr(&node.center_frequency), ln_frequency.exp());
+                set_param(cx, param_ptr(&node.gain_db), gain_db);
+
+                meta.consume();
+            }
+            WindowEvent::MouseScroll(_scroll_x, scroll_y) => {
+                let (x, y) = (cx.mouse().cursorx, cx.mouse().cursory);
+                let Some(node_index) = self.node_at(cx, direction, x, y) else {
+                    return;
+                };
+
+                // Scrolling over a handle adjusts its Q. Multiplying rather than adding keeps the
+                // steps feeling even across the parameter's skewed range.
+                let node = &self.nodes(direction).nodes[node_index];
+                let q = node.q.value() * SCROLL_Q_FACTOR.powf(*scroll_y);
+                set_param(cx, param_ptr(&node.q), q);
+
+                meta.consume();
+            }
+            WindowEvent::MouseDoubleClick(MouseButton::Left) => {
+                let (x, y) = (cx.mouse().cursorx, cx.mouse().cursory);
+
+                // Double clicking an existing node switches it off, which is how it gets deleted
+                if let Some(node_index) = self.node_at(cx, direction, x, y) {
+                    let node = &self.nodes(direction).nodes[node_index];
+                    set_param(
+                        cx,
+                        param_ptr(&node.node_type),
+                        EqNodeType::Off.to_index() as f32,
+                    );
+
+                    // A drag was started by the first click of this double click
+                    self.drag = None;
+                    cx.release();
+                    cx.set_active(false);
+                    meta.consume();
+                    return;
+                }
+
+                // Otherwise it creates one at the pointer, if there's a spare
+                let Some(node_index) = self.first_free_node(direction) else {
+                    return;
+                };
+                let bounds = cx.bounds();
+                if bounds.w <= 0.0 {
+                    return;
+                }
+
+                let t = ((x - bounds.x) / bounds.w).clamp(0.0, 1.0);
+                let frequency = (LN_FREQ_RANGE_START_HZ + (LN_FREQ_RANGE * t)).exp();
+
+                let node = &self.nodes(direction).nodes[node_index];
+                set_param(cx, param_ptr(&node.center_frequency), frequency);
+                set_param(cx, param_ptr(&node.gain_db), 0.0);
+                set_param(
+                    cx,
+                    param_ptr(&node.node_type),
+                    EqNodeType::Bell.to_index() as f32,
+                );
+
+                meta.consume();
+            }
+            _ => {}
+        });
     }
 
     fn draw(&self, cx: &mut DrawContext, canvas: &mut Canvas) {
@@ -122,6 +379,8 @@ impl View for Analyzer {
             return;
         }
 
+        let edited_direction = self.edited_direction.get(cx);
+
         // The analyzer data is pulled directly from the spectral `CompressorBank`
         let mut analyzer_data = self.analyzer_data.lock().unwrap();
         let analyzer_data = analyzer_data.read();
@@ -129,8 +388,8 @@ impl View for Analyzer {
 
         draw_grid(cx, canvas);
         draw_spectrum(cx, canvas, analyzer_data, nyquist);
-        draw_threshold_curve(cx, canvas, analyzer_data);
-        draw_nodes(cx, canvas, analyzer_data);
+        draw_threshold_curve(cx, canvas, analyzer_data, edited_direction);
+        draw_nodes(cx, canvas, analyzer_data, edited_direction);
         draw_gain_reduction(cx, canvas, analyzer_data, nyquist);
 
         // Draw the border last
@@ -289,11 +548,41 @@ fn draw_spectrum(
     canvas.fill_path(&mesh_path, &mesh_paint);
 }
 
+/// Fade a curve's color when it isn't the one being edited.
+fn curve_color(color: vg::Color, is_edited: bool) -> vg::Color {
+    if is_edited {
+        color
+    } else {
+        let mut faded = color;
+        faded.a *= UNSELECTED_CURVE_OPACITY;
+        faded
+    }
+}
+
 /// Draw the frequency and decibel gridlines. This goes underneath everything else so it reads as
 /// background rather than as data.
 fn draw_grid(cx: &mut DrawContext, canvas: &mut Canvas) {
     let bounds = cx.bounds();
-    let paint = vg::Paint::color(GRID_COLOR).with_line_width(cx.scale_factor());
+    let line_width = cx.scale_factor();
+
+    // The minor lines go down first so the labelled ones sit on top of them
+    let mut minor_path = vg::Path::new();
+    for frequency in MINOR_FREQUENCY_TICKS {
+        let t = frequency_to_t(*frequency);
+        if !(0.0..=1.0).contains(&t) {
+            continue;
+        }
+
+        let x = bounds.x + (bounds.w * t);
+        minor_path.move_to(x, bounds.y);
+        minor_path.line_to(x, bounds.y + bounds.h);
+    }
+    canvas.stroke_path(
+        &minor_path,
+        &vg::Paint::color(MINOR_GRID_COLOR).with_line_width(line_width),
+    );
+
+    let paint = vg::Paint::color(GRID_COLOR).with_line_width(line_width);
 
     let mut path = vg::Path::new();
     for frequency in FREQUENCY_TICKS {
@@ -326,28 +615,40 @@ fn draw_grid(cx: &mut DrawContext, canvas: &mut Canvas) {
 ///
 /// The handles are placed by evaluating the same curve that gets drawn, so a node's handle always
 /// sits exactly on its own curve rather than near it.
-fn draw_nodes(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data: &AnalyzerData) {
+fn draw_nodes(
+    cx: &mut DrawContext,
+    canvas: &mut Canvas,
+    analyzer_data: &AnalyzerData,
+    edited_direction: EditedDirection,
+) {
     let bounds = cx.bounds();
     let scale_factor = cx.scale_factor();
 
     let (upwards_offset_db, downwards_offset_db) = analyzer_data.curve_offsets_db;
-    let curves = [
+    let mut curves = [
         (
             &analyzer_data.upwards_curve_params,
             &analyzer_data.upwards_eq_params,
             upwards_offset_db,
             UPWARDS_THRESHOLD_CURVE_COLOR,
+            EditedDirection::Upwards,
         ),
         (
             &analyzer_data.downwards_curve_params,
             &analyzer_data.downwards_eq_params,
             downwards_offset_db,
             DOWNWARDS_THRESHOLD_CURVE_COLOR,
+            EditedDirection::Downwards,
         ),
     ];
+    // Drawing the edited curve's handles last keeps them on top where they can be grabbed
+    if curves[0].4 == edited_direction {
+        curves.swap(0, 1);
+    }
 
     canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
-    for (curve_params, eq_params, offset_db, color) in curves {
+    for (curve_params, eq_params, offset_db, color, direction) in curves {
+        let color = curve_color(color, direction == edited_direction);
         let curve = Curve::new(curve_params);
         let eq_curve = EqCurve::new(eq_params);
 
@@ -387,13 +688,25 @@ fn draw_nodes(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data: &Analyze
 
 /// Overlays the threshold curves over the spectrum analyzer. The upwards and downwards curves can
 /// have different shapes as well as different offsets, so both are always drawn.
-fn draw_threshold_curve(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data: &AnalyzerData) {
+fn draw_threshold_curve(
+    cx: &mut DrawContext,
+    canvas: &mut Canvas,
+    analyzer_data: &AnalyzerData,
+    edited_direction: EditedDirection,
+) {
     let bounds = cx.bounds();
 
     let line_width = cx.scale_factor() * 3.0;
-    let downwards_paint =
-        vg::Paint::color(DOWNWARDS_THRESHOLD_CURVE_COLOR).with_line_width(line_width);
-    let upwards_paint = vg::Paint::color(UPWARDS_THRESHOLD_CURVE_COLOR).with_line_width(line_width);
+    let downwards_paint = vg::Paint::color(curve_color(
+        DOWNWARDS_THRESHOLD_CURVE_COLOR,
+        edited_direction == EditedDirection::Downwards,
+    ))
+    .with_line_width(line_width);
+    let upwards_paint = vg::Paint::color(curve_color(
+        UPWARDS_THRESHOLD_CURVE_COLOR,
+        edited_direction == EditedDirection::Upwards,
+    ))
+    .with_line_width(line_width);
 
     // This can be done slightly cleverer but for our purposes drawing line segments that are either
     // 1 pixel apart or that split the curve up into 100 segments (whichever results in the least
@@ -517,4 +830,12 @@ fn draw_gain_reduction(
         .global_composite_blend_func(vg::BlendFactor::DstAlpha, vg::BlendFactor::OneMinusDstColor);
     canvas.fill_path(&path, &paint);
     canvas.global_composite_blend_func(vg::BlendFactor::One, vg::BlendFactor::OneMinusSrcAlpha);
+}
+
+/// A raw pointer to a parameter, for emitting gestures against it.
+///
+/// The parameters live in the params object held by the editor's data, which outlives every view
+/// here, so these pointers stay valid for as long as they're used.
+fn param_ptr<P: Param>(param: &P) -> ParamPtr {
+    param.as_ptr()
 }

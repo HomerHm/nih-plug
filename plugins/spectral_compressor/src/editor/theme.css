@@ -3,3 +3,19 @@ analyzer {
   border-width: 1px;
   color: #0a0a0a;
 }
+
+/* The buttons picking which threshold curve the analyzer edits. The checked one is filled in so
+   it's obvious at a glance which curve the mouse will act on. */
+.direction-button {
+  background-color: #3c3c3c;
+  border-radius: 3px;
+  child-left: 10px;
+  child-right: 10px;
+  color: #b4b4b4;
+  font-size: 12px;
+}
+
+.direction-button:checked {
+  background-color: #b4b4b4;
+  color: #161616;
+}

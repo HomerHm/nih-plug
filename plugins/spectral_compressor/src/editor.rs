@@ -62,6 +62,41 @@ fn open_url(url: &str) {
     }
 }
 
+/// Which compressor's threshold curve the analyzer is currently editing.
+///
+/// Both curves are always drawn, but only this one responds to the mouse and is drawn at full
+/// opacity. Stage 4 will add a second axis for the processing chain; this is deliberately a
+/// selection rather than a pile of always-visible controls so that adding that axis doesn't
+/// multiply the number of on-screen buttons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditedDirection {
+    Upwards,
+    Downwards,
+}
+
+// NOTE: This is written out rather than derived because the derive macro emits an unqualified
+//       `impl Data for ...`, and `Data` in this module resolves to the editor's own struct.
+impl nih_plug_vizia::vizia::prelude::Data for EditedDirection {
+    fn same(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+impl EditedDirection {
+    fn name(self) -> &'static str {
+        match self {
+            EditedDirection::Upwards => "Upwards",
+            EditedDirection::Downwards => "Downwards",
+        }
+    }
+}
+
+/// Events the editor handles itself, rather than passing on to the parameters.
+pub enum EditorEvent {
+    /// Switch which curve the analyzer edits.
+    SelectDirection(EditedDirection),
+}
+
 #[derive(Clone, Lens)]
 pub struct Data {
     pub(crate) params: Arc<SpectralCompressorParams>,
@@ -69,9 +104,19 @@ pub struct Data {
     pub(crate) analyzer_data: Arc<Mutex<triple_buffer::Output<AnalyzerData>>>,
     /// Used by the analyzer to determine which FFT bins belong to which frequencies.
     pub(crate) sample_rate: Arc<AtomicF32>,
+
+    /// Which curve the analyzer edits. Editor state rather than a parameter, since it changes
+    /// nothing about the sound.
+    pub(crate) edited_direction: EditedDirection,
 }
 
-impl Model for Data {}
+impl Model for Data {
+    fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
+        event.map(|editor_event, _| match editor_event {
+            EditorEvent::SelectDirection(direction) => self.edited_direction = *direction,
+        });
+    }
+}
 
 // Makes sense to also define this here, makes it a bit easier to keep track of
 pub(crate) fn default_state() -> Arc<ViziaState> {
@@ -89,18 +134,65 @@ pub(crate) fn create(editor_state: Arc<ViziaState>, editor_data: Data) -> Option
 
         editor_data.clone().build(cx);
 
-        VStack::new(cx, |cx| {
-            title_bar(cx);
-            // `Stretch` here is what keeps the controls below from ever being clipped: they take
-            // their natural height first and the analyzer gets the remainder.
-            analyzer(cx);
-            controls(cx);
-            threshold_eq(cx);
-        })
-        .row_between(Pixels(10.0));
+        // Both links wrap the whole editor rather than just the controls they belong to, because
+        // nodes can also be edited by dragging them on the analyzer. Anything narrower would
+        // leave those edits unmirrored. Each view only ever acts on its own pairs, so nesting
+        // them is harmless.
+        param_links(cx, |cx| {
+            VStack::new(cx, |cx| {
+                title_bar(cx);
+                // `Stretch` here is what keeps the controls below from ever being clipped: they
+                // take their natural height first and the analyzer gets the remainder.
+                analyzer(cx);
+                controls(cx);
+                threshold_eq(cx);
+            })
+            .row_between(Pixels(10.0));
+        });
 
         ResizeHandle::new(cx);
     })
+}
+
+/// Wrap `content` in the views that keep the two compressors' threshold curves in step.
+fn param_links(cx: &mut Context, content: impl FnOnce(&mut Context)) {
+    let params = Data::params.get(cx);
+
+    // Downwards leads, so switching a link on pulls the upwards curve onto the downwards one
+    let curve_pairs = ["curve_center", "curve_slope", "curve_curve"]
+        .iter()
+        .map(|id| {
+            (
+                param_ptr_by_id(&params.compressors.downwards, id),
+                param_ptr_by_id(&params.compressors.upwards, id),
+            )
+        })
+        .collect();
+    // Pairing by ID rather than listing the parameters means adding one to `EqNodeParams` later
+    // cannot silently leave it out of the link
+    let eq_pairs = param_ptr_pairs(
+        &params.compressors.downwards.eq,
+        &params.compressors.upwards.eq,
+    );
+
+    let curve_link_ptr = param_ptr_by_id(&params.threshold, "thresh_link");
+    let eq_link_ptr = param_ptr_by_id(&params.threshold, "eq_link");
+    let curve_linked = {
+        let params = params.clone();
+        move || params.threshold.slope_curve_link.value()
+    };
+    let eq_linked = {
+        let params = params.clone();
+        move || params.threshold.eq_link.value()
+    };
+
+    ParamLink::new(cx, curve_linked, curve_link_ptr, curve_pairs, |cx| {
+        ParamLink::new(cx, eq_linked, eq_link_ptr, eq_pairs, content)
+            .width(Stretch(1.0))
+            .height(Stretch(1.0));
+    })
+    .width(Stretch(1.0))
+    .height(Stretch(1.0));
 }
 
 fn title_bar(cx: &mut Context) {
@@ -133,15 +225,43 @@ fn title_bar(cx: &mut Context) {
 
 fn analyzer(cx: &mut Context) {
     VStack::new(cx, |cx| {
-        Analyzer::new(cx, Data::analyzer_data, Data::sample_rate)
-            // Soaks up all vertical space the controls below don't need
-            .height(Stretch(1.0));
+        direction_selector(cx);
+
+        Analyzer::new(
+            cx,
+            Data::analyzer_data,
+            Data::sample_rate,
+            Data::params,
+            Data::edited_direction,
+        )
+        // Soaks up all vertical space the controls below don't need
+        .height(Stretch(1.0));
 
         frequency_scale(cx);
     })
     .height(Stretch(1.0))
     .left(Pixels(12.0))
     .right(Pixels(12.0));
+}
+
+/// The buttons picking which curve the analyzer edits.
+///
+/// These sit directly above the graph they act on. Stage 4's chain selector belongs next to them.
+fn direction_selector(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        for direction in [EditedDirection::Upwards, EditedDirection::Downwards] {
+            Button::new(
+                cx,
+                move |cx| cx.emit(EditorEvent::SelectDirection(direction)),
+                move |cx| Label::new(cx, direction.name()),
+            )
+            .checked(Data::edited_direction.map(move |edited| *edited == direction))
+            .class("direction-button");
+        }
+    })
+    .height(Pixels(22.0))
+    .col_between(Pixels(4.0))
+    .bottom(Pixels(4.0));
 }
 
 /// The frequency labels underneath the analyzer.
@@ -197,45 +317,18 @@ fn controls(cx: &mut Context) {
     .child_right(Stretch(1.0));
 }
 
-/// The Upwards and Downwards columns, wrapped in the view that keeps their threshold curve shapes
-/// in lockstep while the link is enabled.
+/// The Upwards and Downwards columns, with the toggle that links their curve shapes above them.
 fn compressor_columns(cx: &mut Context) {
-    let params = Data::params.get(cx);
+    VStack::new(cx, |cx| {
+        ParamButton::new(cx, Data::params, |p| &p.threshold.slope_curve_link)
+            .with_label("Thresh Curve Link")
+            .left(Stretch(1.0))
+            .right(Stretch(1.0))
+            .bottom(Pixels(4.0));
 
-    // These IDs are the ones declared on `CompressorParams`; the `upwards`/`downwards` prefixes
-    // are added a level up and are not part of them. Downwards is the leader, so switching the
-    // link on pulls the upwards curve onto the downwards one rather than the other way around.
-    let pairs = ["curve_center", "curve_slope", "curve_curve"]
-        .iter()
-        .map(|id| {
-            (
-                param_ptr_by_id(&params.compressors.downwards, id),
-                param_ptr_by_id(&params.compressors.upwards, id),
-            )
-        })
-        .collect();
-
-    let link_ptr = param_ptr_by_id(&params.threshold, "thresh_link");
-    let is_linked = {
-        let params = params.clone();
-        move || params.threshold.slope_curve_link.value()
-    };
-
-    // NOTE: The link button lives inside `ParamLink` so that toggling it is visible to the view,
-    //       which needs to sync the two sides the moment the link is switched on.
-    ParamLink::new(cx, is_linked, link_ptr, pairs, |cx| {
-        VStack::new(cx, |cx| {
-            ParamButton::new(cx, Data::params, |p| &p.threshold.slope_curve_link)
-                .with_label("Thresh Curve Link")
-                .left(Stretch(1.0))
-                .right(Stretch(1.0))
-                .bottom(Pixels(4.0));
-
-            HStack::new(cx, |cx| {
-                compressor_column(cx, "Upwards");
-                compressor_column(cx, "Downwards");
-            })
-            .height(Auto);
+        HStack::new(cx, |cx| {
+            compressor_column(cx, "Upwards");
+            compressor_column(cx, "Downwards");
         })
         .height(Auto);
     })
@@ -295,37 +388,19 @@ fn make_column(cx: &mut Context, title: &str, contents: impl FnOnce(&mut Context
 /// verified before the nodes become draggable on the analyzer itself, and should go away once
 /// they are.
 fn threshold_eq(cx: &mut Context) {
-    let params = Data::params.get(cx);
+    VStack::new(cx, |cx| {
+        ParamButton::new(cx, Data::params, |p| &p.threshold.eq_link)
+            .with_label("Thresh EQ Link")
+            .left(Stretch(1.0))
+            .right(Stretch(1.0));
 
-    // Pairing by ID rather than listing the parameters means adding one to `EqNodeParams` later
-    // cannot silently leave it out of the link
-    let pairs = param_ptr_pairs(
-        &params.compressors.downwards.eq,
-        &params.compressors.upwards.eq,
-    );
-    let link_ptr = param_ptr_by_id(&params.threshold, "eq_link");
-    let is_linked = {
-        let params = params.clone();
-        move || params.threshold.eq_link.value()
-    };
-
-    // NOTE: As with the curve link, the button has to be inside the view that acts on it.
-    ParamLink::new(cx, is_linked, link_ptr, pairs, |cx| {
-        VStack::new(cx, |cx| {
-            ParamButton::new(cx, Data::params, |p| &p.threshold.eq_link)
-                .with_label("Thresh EQ Link")
-                .left(Stretch(1.0))
-                .right(Stretch(1.0));
-
-            HStack::new(cx, |cx| {
-                threshold_eq_section(cx, "Upwards");
-                threshold_eq_section(cx, "Downwards");
-            })
-            .height(Auto)
-            .child_left(Stretch(1.0))
-            .child_right(Stretch(1.0));
+        HStack::new(cx, |cx| {
+            threshold_eq_section(cx, "Upwards");
+            threshold_eq_section(cx, "Downwards");
         })
-        .height(Auto);
+        .height(Auto)
+        .child_left(Stretch(1.0))
+        .child_right(Stretch(1.0));
     })
     .height(Auto)
     .bottom(Pixels(12.0));

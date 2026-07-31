@@ -319,6 +319,8 @@ impl Plugin for SpectralCompressor {
 
                 analyzer_data: self.analyzer_output_data.clone(),
                 sample_rate: self.sample_rate.clone(),
+
+                edited_direction: editor::EditedDirection::Downwards,
             },
         )
     }
