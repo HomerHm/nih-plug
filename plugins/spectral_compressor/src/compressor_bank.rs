@@ -121,16 +121,7 @@ pub struct ThresholdParams {
     /// Spectral Compressor. In the polynomial below, this is the intercept.
     #[id = "tresh_global"]
     pub threshold_db: FloatParam,
-    /// The center frqeuency for the target curve when sidechaining is not enabled. The curve is a
-    /// polynomial `threshold_db + curve_slope*x + curve_curve*(x^2)` that evaluates to a decibel
-    /// value, where `x = ln(center_frequency) - ln(bin_frequency)`. In other words, this is
-    /// evaluated in the log/log domain for decibels and octaves. The slope and curve coefficients
-    /// live on each [`CompressorParams`] so the two directions can have different curve shapes
-    /// while still pivoting around a shared center frequency.
-    #[id = "thresh_center_freq"]
-    pub center_frequency: FloatParam,
-
-    /// Mirrors the slope and curve values between the upwards and downwards compressors while
+    /// Mirrors the threshold curve shape between the upwards and downwards compressors while
     /// enabled.
     ///
     /// The mirroring deliberately happens in the editor rather than in the DSP: each compressor
@@ -190,8 +181,14 @@ pub struct CompressorBankParams {
 /// Both versions will have a parameter ID and a parameter name prefix to distinguish them.
 #[derive(Params)]
 pub struct CompressorParams {
-    /// The slope for this compressor's threshold curve, in the log/log domain. See
-    /// [`ThresholdParams::center_frequency`] for the full polynomial.
+    /// The center frequency this compressor's threshold curve pivots around. The curve is a
+    /// polynomial `threshold_db + curve_slope*x + curve_curve*(x^2)` that evaluates to a decibel
+    /// value, where `x = ln(center_frequency) - ln(bin_frequency)`. In other words, this is
+    /// evaluated in the log/log domain for decibels and octaves.
+    #[id = "curve_center"]
+    pub center_frequency: FloatParam,
+    /// The slope for this compressor's threshold curve, in the log/log domain. See the polynomial
+    /// above.
     #[id = "curve_slope"]
     pub curve_slope: FloatParam,
     /// The, uh, 'curve' for this compressor's threshold curve, in the logarithmic domain. This is
@@ -251,25 +248,11 @@ impl ThresholdParams {
             .with_callback(set_update_both_thresholds.clone())
             .with_unit(" dB")
             .with_step_size(0.1),
-            center_frequency: FloatParam::new(
-                "Threshold Center",
-                420.0,
-                FloatRange::Skewed {
-                    min: 20.0,
-                    max: 20_000.0,
-                    factor: FloatRange::skew_factor(-2.0),
-                },
-            )
-            .with_callback(set_update_both_thresholds.clone())
-            // This includes the unit
-            .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
-            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
-
             // Purely an editor concern, so it needs no callback: the DSP always reads each
             // compressor's own slope and curve regardless of this value. The editor draws this
             // above the two compressor columns instead of in the threshold column, so it's hidden
             // from the generic UI to avoid showing up twice.
-            slope_curve_link: BoolParam::new("Slope/Curve Link", true).hide_in_generic_ui(),
+            slope_curve_link: BoolParam::new("Thresh Curve Link", true).hide_in_generic_ui(),
 
             mode: EnumParam::new("Mode", ThresholdMode::Internal)
                 // Not the most efficient way to do this, but it's a bit cleaner than the
@@ -292,7 +275,7 @@ impl ThresholdParams {
     pub fn curve_params(&self, compressor: &CompressorParams) -> CurveParams {
         CurveParams {
             intercept: self.threshold_db.value(),
-            center_frequency: self.center_frequency.value(),
+            center_frequency: compressor.center_frequency.value(),
             // The cheeky 3 additional dB/octave attenuation is to match pink noise with the
             // default settings. When using sidechaining we explicitly don't want this because
             // the curve should be a flat offset to the sidechain input at the default settings.
@@ -358,10 +341,25 @@ impl CompressorParams {
         });
 
         CompressorParams {
-            // These are polynomial coefficients that are evaluated in the log/log domain
-            // (octaves/decibels). `ThresholdParams::threshold_db` is the intercept.
+            // These three shape this compressor's threshold curve and share a "Thresh" prefix so
+            // they read as one group, distinct from the compression parameters below them. They
+            // are polynomial coefficients evaluated in the log/log domain (octaves/decibels), with
+            // `ThresholdParams::threshold_db` as the intercept.
+            center_frequency: FloatParam::new(
+                format!("{name_prefix} Thresh Center"),
+                420.0,
+                FloatRange::Skewed {
+                    min: 20.0,
+                    max: 20_000.0,
+                    factor: FloatRange::skew_factor(-2.0),
+                },
+            )
+            .with_callback(set_update_thresholds.clone())
+            // This includes the unit
+            .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
             curve_slope: FloatParam::new(
-                format!("{name_prefix} Slope"),
+                format!("{name_prefix} Thresh Slope"),
                 0.0,
                 FloatRange::SymmetricalSkewed {
                     min: -36.0,
@@ -374,7 +372,7 @@ impl CompressorParams {
             .with_unit(" dB/oct")
             .with_step_size(0.01),
             curve_curve: FloatParam::new(
-                format!("{name_prefix} Curve"),
+                format!("{name_prefix} Thresh Curve"),
                 0.0,
                 FloatRange::SymmetricalSkewed {
                     min: -24.0,

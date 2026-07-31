@@ -159,37 +159,40 @@ fn controls(cx: &mut Context) {
     .child_right(Stretch(1.0));
 }
 
-/// The Upwards and Downwards columns, wrapped in the view that keeps their slope and curve values
+/// The Upwards and Downwards columns, wrapped in the view that keeps their threshold curve shapes
 /// in lockstep while the link is enabled.
 fn compressor_columns(cx: &mut Context) {
     let params = Data::params.get(cx);
 
     // These IDs are the ones declared on `CompressorParams`; the `upwards`/`downwards` prefixes
-    // are added a level up and are not part of them
-    let pairs = vec![
-        (
-            param_ptr_by_id(&params.compressors.upwards, "curve_slope"),
-            param_ptr_by_id(&params.compressors.downwards, "curve_slope"),
-        ),
-        (
-            param_ptr_by_id(&params.compressors.upwards, "curve_curve"),
-            param_ptr_by_id(&params.compressors.downwards, "curve_curve"),
-        ),
-    ];
+    // are added a level up and are not part of them. Downwards is the leader, so switching the
+    // link on pulls the upwards curve onto the downwards one rather than the other way around.
+    let pairs = ["curve_center", "curve_slope", "curve_curve"]
+        .iter()
+        .map(|id| {
+            (
+                param_ptr_by_id(&params.compressors.downwards, id),
+                param_ptr_by_id(&params.compressors.upwards, id),
+            )
+        })
+        .collect();
 
+    let link_ptr = param_ptr_by_id(&params.threshold, "thresh_link");
     let is_linked = {
         let params = params.clone();
         move || params.threshold.slope_curve_link.value()
     };
 
-    VStack::new(cx, |cx| {
-        ParamButton::new(cx, Data::params, |p| &p.threshold.slope_curve_link)
-            .with_label("Slope/Curve Link")
-            .left(Stretch(1.0))
-            .right(Stretch(1.0))
-            .bottom(Pixels(4.0));
+    // NOTE: The link button lives inside `ParamLink` so that toggling it is visible to the view,
+    //       which needs to sync the two sides the moment the link is switched on.
+    ParamLink::new(cx, is_linked, link_ptr, pairs, |cx| {
+        VStack::new(cx, |cx| {
+            ParamButton::new(cx, Data::params, |p| &p.threshold.slope_curve_link)
+                .with_label("Thresh Curve Link")
+                .left(Stretch(1.0))
+                .right(Stretch(1.0))
+                .bottom(Pixels(4.0));
 
-        ParamLink::new(cx, is_linked, pairs, |cx| {
             HStack::new(cx, |cx| {
                 compressor_column(cx, "Upwards");
                 compressor_column(cx, "Downwards");

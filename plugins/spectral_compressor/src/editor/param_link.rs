@@ -30,11 +30,17 @@ use std::sync::Arc;
 /// the same value: each slider shows the same number, the host records automation for both, and
 /// nothing has to special-case the link when the values are read.
 ///
+/// The widget controlling `link_ptr` must be built inside this view as well, since enabling the
+/// link has to copy values across immediately rather than waiting for the next gesture.
+///
 /// Only the parameters that are actually paired are affected; everything else passes through.
 pub struct ParamLink<L> {
     /// Read on every gesture, so toggling the link takes effect immediately.
     is_linked: L,
-    /// Gestures on either side of a pair are mirrored onto the other side.
+    /// The boolean parameter that switches mirroring on and off.
+    link_ptr: ParamPtr,
+    /// `(leader, follower)` pairs. Gestures on *either* side are mirrored onto the other, but the
+    /// direction matters when the link is switched on: the follower adopts the leader's value.
     pairs: Vec<(ParamPtr, ParamPtr)>,
     /// Parameters we have just emitted a mirrored gesture for. That gesture bubbles back through
     /// this view, and mirroring it a second time would ping-pong between the two forever. An entry
@@ -46,33 +52,55 @@ impl<L> ParamLink<L>
 where
     L: 'static + Fn() -> bool,
 {
-    /// Wrap `content` so that gestures are mirrored between each `(a, b)` pair whenever
-    /// `is_linked` returns true.
+    /// Wrap `content` so that gestures are mirrored between each `(leader, follower)` pair
+    /// whenever `is_linked` returns true. `content` must include the widget for `link_ptr`.
     pub fn new(
         cx: &mut Context,
         is_linked: L,
+        link_ptr: ParamPtr,
         pairs: Vec<(ParamPtr, ParamPtr)>,
         content: impl FnOnce(&mut Context),
     ) -> Handle<'_, Self> {
         Self {
             is_linked,
+            link_ptr,
             pairs,
             suppressed: HashSet::new(),
         }
         .build(cx, |cx| content(cx))
     }
 
-    /// The parameter `ptr` is paired with, if any. Pairs are symmetric.
+    /// The parameter `ptr` is paired with, if any. Pairs are symmetric for mirroring purposes.
     fn counterpart(&self, ptr: ParamPtr) -> Option<ParamPtr> {
-        self.pairs.iter().find_map(|(a, b)| {
-            if *a == ptr {
-                Some(*b)
-            } else if *b == ptr {
-                Some(*a)
+        self.pairs.iter().find_map(|(leader, follower)| {
+            if *leader == ptr {
+                Some(*follower)
+            } else if *follower == ptr {
+                Some(*leader)
             } else {
                 None
             }
         })
+    }
+
+    /// Copy every leader's value onto its follower as a complete gesture.
+    ///
+    /// Mirroring alone only reacts to edits, so without this the two sides would stay at whatever
+    /// different values they happened to hold when the link was switched on, and the link would
+    /// look like it had silently done nothing until the next time a slider was touched.
+    fn adopt_leader_values(&mut self, cx: &mut EventContext) {
+        // Indexing rather than iterating so `suppressed` can be updated in the same loop
+        for i in 0..self.pairs.len() {
+            let (leader, follower) = self.pairs[i];
+            // SAFETY: These pointers come from the params object owned by the editor's `Data`,
+            //         which outlives this view.
+            let value = unsafe { leader.unmodulated_normalized_value() };
+
+            cx.emit(RawParamEvent::BeginSetParameter(follower));
+            cx.emit(RawParamEvent::SetParameterNormalized(follower, value));
+            cx.emit(RawParamEvent::EndSetParameter(follower));
+            self.suppressed.insert(follower);
+        }
     }
 }
 
@@ -93,6 +121,17 @@ where
                 // Not a gesture, so there is nothing to mirror
                 RawParamEvent::ParametersChanged => return,
             };
+
+            if ptr == self.link_ptr {
+                // The parameter itself has not been updated yet at this point, so the new state
+                // has to come from the event rather than from `is_linked`
+                if let RawParamEvent::SetParameterNormalized(_, normalized) = param_event {
+                    if *normalized >= 0.5 {
+                        self.adopt_leader_values(cx);
+                    }
+                }
+                return;
+            }
 
             // This is the echo of a gesture we emitted ourselves. Let it through untouched, and
             // stop suppressing the parameter once its gesture has ended.
