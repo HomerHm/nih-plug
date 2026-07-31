@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use crate::analyzer::AnalyzerData;
 use crate::curve::{Curve, CurveParams};
+use crate::eq_curve::{power_to_db, EqBankParams, EqCurve, EqCurveParams};
 use crate::SpectralCompressorParams;
 
 // These are the parameter name prefixes used for the downwards and upwards compression parameters.
@@ -67,6 +68,12 @@ pub struct CompressorBank {
     /// For each compressor bin, `ln(freq)` where `freq` is the frequency associated with that
     /// compressor. This is precomputed since all update functions need it.
     ln_freqs: Vec<f32>,
+    /// The plain frequency in Hertz for each bin. The EQ nodes need this rather than its logarithm,
+    /// and caching it turns their `freq / center_freq` into a single multiplication per bin.
+    freqs: Vec<f32>,
+    /// Scratch space for accumulating the EQ nodes' squared magnitude responses. Kept here so
+    /// updating the thresholds never has to allocate on the audio thread.
+    eq_power: Vec<f32>,
 
     /// Downwards compressor thresholds, in decibels.
     downwards_thresholds_db: Vec<f32>,
@@ -214,6 +221,12 @@ pub struct CompressorParams {
     /// The compression knee width, in decibels.
     #[id = "knee"]
     pub knee_width_db: FloatParam,
+
+    /// EQ-shaped nodes that deform this compressor's threshold curve on top of the polynomial
+    /// above. The `id_prefix` on this struct a level up carries through to the nodes, so their
+    /// IDs end up looking like `upwards_eqfreq_1`.
+    #[nested(group = "Threshold EQ")]
+    pub eq: EqBankParams,
 }
 
 impl ThresholdParams {
@@ -394,7 +407,7 @@ impl CompressorParams {
                     max: 50.0,
                 },
             )
-            .with_callback(set_update_thresholds)
+            .with_callback(set_update_thresholds.clone())
             .with_unit(" dB")
             .with_step_size(0.1),
             ratio: FloatParam::new(
@@ -438,6 +451,8 @@ impl CompressorParams {
             .with_callback(set_update_knee_parabolas)
             .with_unit(" dB")
             .with_step_size(0.1),
+
+            eq: EqBankParams::new(name_prefix, set_update_thresholds),
         }
     }
 }
@@ -461,6 +476,8 @@ impl CompressorBank {
             should_update_upwards_knee_parabolas: Arc::new(AtomicBool::new(true)),
 
             ln_freqs: Vec::with_capacity(complex_buffer_len),
+            freqs: Vec::with_capacity(complex_buffer_len),
+            eq_power: Vec::with_capacity(complex_buffer_len),
 
             downwards_thresholds_db: Vec::with_capacity(complex_buffer_len),
             downwards_ratios: Vec::with_capacity(complex_buffer_len),
@@ -492,6 +509,10 @@ impl CompressorBank {
 
         self.ln_freqs
             .reserve_exact(complex_buffer_len.saturating_sub(self.ln_freqs.len()));
+        self.freqs
+            .reserve_exact(complex_buffer_len.saturating_sub(self.freqs.len()));
+        self.eq_power
+            .reserve_exact(complex_buffer_len.saturating_sub(self.eq_power.len()));
 
         self.downwards_thresholds_db
             .reserve_exact(complex_buffer_len.saturating_sub(self.downwards_thresholds_db.len()));
@@ -537,10 +558,19 @@ impl CompressorBank {
         // These 2-log frequencies are needed when updating the compressor parameters, so we'll just
         // precompute them to avoid having to repeat the same expensive computations all the time
         self.ln_freqs.resize(complex_buffer_len, 0.0);
+        self.freqs.resize(complex_buffer_len, 0.0);
+        self.eq_power.resize(complex_buffer_len, 1.0);
         // The first one should always stay at zero, `0.0f32.ln() == NaN`.
-        for (i, ln_freq) in self.ln_freqs.iter_mut().enumerate().skip(1) {
+        for (i, (ln_freq, freq_hz)) in self
+            .ln_freqs
+            .iter_mut()
+            .zip(self.freqs.iter_mut())
+            .enumerate()
+            .skip(1)
+        {
             let freq = (i as f32 / window_size as f32) * buffer_config.sample_rate;
             *ln_freq = freq.ln();
+            *freq_hz = freq;
         }
 
         self.downwards_thresholds_db.resize(complex_buffer_len, 1.0);
@@ -654,6 +684,8 @@ impl CompressorBank {
                 params.threshold.curve_params(&params.compressors.downwards);
             analyzer_input_data.upwards_curve_params =
                 params.threshold.curve_params(&params.compressors.upwards);
+            analyzer_input_data.downwards_eq_params = params.compressors.downwards.eq.snapshot();
+            analyzer_input_data.upwards_eq_params = params.compressors.upwards.eq.snapshot();
             analyzer_input_data.curve_offsets_db = (
                 params.compressors.upwards.threshold_offset_db.value(),
                 params.compressors.downwards.threshold_offset_db.value(),
@@ -1066,6 +1098,46 @@ impl CompressorBank {
         }
     }
 
+    /// Fill `thresholds_db` with one compressor's threshold curve: the quadratic polynomial plus
+    /// the contribution of every active EQ node, offset by that compressor's threshold offset.
+    ///
+    /// The EQ nodes are accumulated as squared magnitudes and converted to decibels only once per
+    /// bin at the end. Summing each node's decibels instead would cost a logarithm per node per
+    /// bin, which is where practically all of the time would go.
+    fn recompute_thresholds(
+        freqs: &[f32],
+        ln_freqs: &[f32],
+        eq_power: &mut [f32],
+        thresholds_db: &mut [f32],
+        curve_params: &CurveParams,
+        eq_params: &EqCurveParams,
+        intercept_db: f32,
+    ) {
+        let curve = Curve::new(curve_params);
+        let eq_curve = EqCurve::new(eq_params);
+
+        // Skipping the scratch buffer entirely when every node is off keeps the common case as
+        // cheap as it was before the nodes existed
+        if eq_curve.is_empty() {
+            for (ln_freq, threshold_db) in ln_freqs.iter().zip(thresholds_db.iter_mut()) {
+                *threshold_db =
+                    (curve.evaluate_ln(*ln_freq) + intercept_db).max(util::MINUS_INFINITY_DB);
+            }
+            return;
+        }
+
+        eq_power.fill(1.0);
+        eq_curve.accumulate_power(freqs, eq_power);
+        for ((ln_freq, eq_power), threshold_db) in ln_freqs
+            .iter()
+            .zip(eq_power.iter())
+            .zip(thresholds_db.iter_mut())
+        {
+            *threshold_db = (curve.evaluate_ln(*ln_freq) + power_to_db(*eq_power) + intercept_db)
+                .max(util::MINUS_INFINITY_DB);
+        }
+    }
+
     /// Update the compressors if needed. This is called just before processing, and the compressors
     /// are updated in accordance to the atomic flags set on this struct.
     fn update_if_needed(&mut self, params: &SpectralCompressorParams) {
@@ -1077,17 +1149,15 @@ impl CompressorBank {
             .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            let curve_params = params.threshold.curve_params(&params.compressors.downwards);
-            let curve = Curve::new(&curve_params);
-
-            let downwards_intercept = params.compressors.downwards.threshold_offset_db.value();
-            for (ln_freq, threshold_db) in self
-                .ln_freqs
-                .iter()
-                .zip(self.downwards_thresholds_db.iter_mut())
-            {
-                *threshold_db = curve.evaluate_ln(*ln_freq) + downwards_intercept;
-            }
+            Self::recompute_thresholds(
+                &self.freqs,
+                &self.ln_freqs,
+                &mut self.eq_power,
+                &mut self.downwards_thresholds_db,
+                &params.threshold.curve_params(&params.compressors.downwards),
+                &params.compressors.downwards.eq.snapshot(),
+                params.compressors.downwards.threshold_offset_db.value(),
+            );
         }
 
         if self
@@ -1095,17 +1165,15 @@ impl CompressorBank {
             .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            let curve_params = params.threshold.curve_params(&params.compressors.upwards);
-            let curve = Curve::new(&curve_params);
-
-            let upwards_intercept = params.compressors.upwards.threshold_offset_db.value();
-            for (ln_freq, threshold_db) in self
-                .ln_freqs
-                .iter()
-                .zip(self.upwards_thresholds_db.iter_mut())
-            {
-                *threshold_db = curve.evaluate_ln(*ln_freq) + upwards_intercept;
-            }
+            Self::recompute_thresholds(
+                &self.freqs,
+                &self.ln_freqs,
+                &mut self.eq_power,
+                &mut self.upwards_thresholds_db,
+                &params.threshold.curve_params(&params.compressors.upwards),
+                &params.compressors.upwards.eq.snapshot(),
+                params.compressors.upwards.threshold_offset_db.value(),
+            );
         }
 
         if self

@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::analyzer::AnalyzerData;
 use crate::curve::{Curve, CurveParams};
+use crate::eq_curve::{EqCurve, EqCurveParams};
 
 // We'll show the bins from 30 Hz (to your chest) to 22 kHz, scaled logarithmically
 #[allow(unused)]
@@ -271,8 +272,12 @@ fn draw_threshold_curve(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data
     // amount of line segments) should be sufficient
     let num_points = 100.min(bounds.w.ceil() as usize);
 
-    let mut draw_curve = |curve_params: &CurveParams, offset_db: f32, paint: vg::Paint| {
+    let mut draw_curve = |curve_params: &CurveParams,
+                          eq_params: &EqCurveParams,
+                          offset_db: f32,
+                          paint: vg::Paint| {
         let curve = Curve::new(curve_params);
+        let eq_curve = EqCurve::new(eq_params);
 
         let mut path = vg::Path::new();
         for i in 0..num_points {
@@ -280,8 +285,9 @@ fn draw_threshold_curve(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data
             let ln_freq = LN_FREQ_RANGE_START_HZ + (LN_FREQ_RANGE * x_t);
 
             // Evaluating the curve results in a value in dB, which must then be mapped to the same
-            // scale used in `draw_spectrum()`
-            let y_db = curve.evaluate_ln(ln_freq) + offset_db;
+            // scale used in `draw_spectrum()`. The nodes are evaluated the same way the compressor
+            // bank does it, so the drawn curve matches the audible one.
+            let y_db = curve.evaluate_ln(ln_freq) + eq_curve.evaluate_db(ln_freq.exp()) + offset_db;
             let y_t = db_to_unclamped_t(y_db);
 
             let physical_x_pos = bounds.x + (bounds.w * x_t);
@@ -305,11 +311,13 @@ fn draw_threshold_curve(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data
     let (upwards_offset_db, downwards_offset_db) = analyzer_data.curve_offsets_db;
     draw_curve(
         &analyzer_data.upwards_curve_params,
+        &analyzer_data.upwards_eq_params,
         upwards_offset_db,
         upwards_paint,
     );
     draw_curve(
         &analyzer_data.downwards_curve_params,
+        &analyzer_data.downwards_eq_params,
         downwards_offset_db,
         downwards_paint,
     );

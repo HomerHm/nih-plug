@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use self::analyzer::Analyzer;
 use self::param_link::{param_ptr_by_id, ParamLink};
 use crate::analyzer::AnalyzerData;
+use crate::eq_curve::MAX_EQ_NODES;
 use crate::{SpectralCompressor, SpectralCompressorParams};
 
 mod analyzer;
@@ -37,7 +38,7 @@ const GUI_WIDTH: u32 = 1360;
 /// The controls take exactly as much vertical space as they need and the analyzer absorbs whatever
 /// is left over, so this number only sets how much room the analyzer gets. Growing a control
 /// column can therefore never truncate it -- it just eats into the analyzer.
-const GUI_HEIGHT: u32 = 760;
+const GUI_HEIGHT: u32 = 900;
 // I couldn't get `LayoutType::Grid` to work as expected, so we'll fake a 4x4 grid with
 // hardcoded column widths
 const COLUMN_WIDTH: Units = Pixels(330.0);
@@ -94,6 +95,7 @@ pub(crate) fn create(editor_state: Arc<ViziaState>, editor_data: Data) -> Option
             // their natural height first and the analyzer gets the remainder.
             analyzer(cx);
             controls(cx);
+            threshold_eq(cx);
         })
         .row_between(Pixels(10.0));
 
@@ -211,10 +213,7 @@ fn compressor_column(cx: &mut Context, direction: &'static str) {
     make_column(cx, direction, move |cx| {
         // We don't want to show the 'Upwards'/'Downwards' prefix here, but it should still be in
         // the parameter name so the parameter list makes sense
-        let compressor_params = Data::params.map(move |p| match direction {
-            "Upwards" => p.compressors.upwards.clone(),
-            _ => p.compressors.downwards.clone(),
-        });
+        let compressor_params = compressor_params_lens(direction);
         let strip_prefix = format!("{direction} ");
         GenericUi::new_custom(cx, compressor_params, move |cx, param_ptr| {
             HStack::new(cx, |cx| {
@@ -248,4 +247,69 @@ fn make_column(cx: &mut Context, title: &str, contents: impl FnOnce(&mut Context
     })
     .width(COLUMN_WIDTH)
     .height(Auto);
+}
+
+/// The threshold curve's EQ nodes, one section per compressor.
+///
+/// These sit below the four control columns and span the full width, because a node needs four
+/// controls and cramming those into a 330 pixel column would leave them unusably narrow. One row
+/// per node also keeps this section six rows tall instead of twenty-four.
+fn threshold_eq(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        threshold_eq_section(cx, "Upwards");
+        threshold_eq_section(cx, "Downwards");
+    })
+    .height(Auto)
+    .bottom(Pixels(12.0))
+    .child_left(Stretch(1.0))
+    .child_right(Stretch(1.0));
+}
+
+fn threshold_eq_section(cx: &mut Context, direction: &'static str) {
+    let params = compressor_params_lens(direction);
+
+    VStack::new(cx, |cx| {
+        Label::new(cx, &format!("{direction} Threshold EQ"))
+            .font_family(vec![FamilyOwned::Name(String::from(assets::NOTO_SANS))])
+            .font_weight(FontWeightKeyword::Thin)
+            .font_size(23.0)
+            .left(Stretch(1.0))
+            .right(Pixels(7.0))
+            .bottom(Pixels(-4.0));
+
+        for index in 0..MAX_EQ_NODES {
+            HStack::new(cx, move |cx| {
+                Label::new(cx, &format!("{}", index + 1))
+                    .width(Pixels(16.0))
+                    .top(Stretch(1.0))
+                    .bottom(Stretch(1.0));
+
+                // A node is inert until its type is set to something other than Off, so the type
+                // comes first and the three values that shape it follow
+                ParamSlider::new(cx, params, move |p| &p.eq.nodes[index].node_type)
+                    .set_style(ParamSliderStyle::CurrentStepLabeled { even: false })
+                    .width(Stretch(1.3));
+                ParamSlider::new(cx, params, move |p| &p.eq.nodes[index].center_frequency)
+                    .width(Stretch(1.0));
+                ParamSlider::new(cx, params, move |p| &p.eq.nodes[index].gain_db)
+                    .width(Stretch(1.0));
+                ParamSlider::new(cx, params, move |p| &p.eq.nodes[index].q).width(Stretch(0.8));
+            })
+            .height(Pixels(26.0))
+            .col_between(Pixels(2.0))
+            .class("row");
+        }
+    })
+    .width(Pixels(660.0))
+    .height(Auto);
+}
+
+/// A lens to one compressor's parameters, picked by the same name used for its heading.
+fn compressor_params_lens(
+    direction: &'static str,
+) -> impl Lens<Target = Arc<crate::compressor_bank::CompressorParams>> {
+    Data::params.map(move |p| match direction {
+        "Upwards" => p.compressors.upwards.clone(),
+        _ => p.compressors.downwards.clone(),
+    })
 }

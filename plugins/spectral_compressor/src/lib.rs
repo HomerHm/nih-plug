@@ -29,6 +29,7 @@ mod compressor_bank;
 mod curve;
 mod dry_wet_mixer;
 mod editor;
+mod eq_curve;
 
 const MIN_WINDOW_ORDER: usize = 6;
 #[allow(dead_code)]
