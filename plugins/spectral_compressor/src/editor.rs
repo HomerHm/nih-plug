@@ -22,7 +22,7 @@ use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use std::sync::{Arc, Mutex};
 
 use self::analyzer::Analyzer;
-use self::param_link::{param_ptr_by_id, ParamLink};
+use self::param_link::{param_ptr_by_id, param_ptr_pairs, ParamLink};
 use crate::analyzer::AnalyzerData;
 use crate::eq_curve::MAX_EQ_NODES;
 use crate::{SpectralCompressor, SpectralCompressorParams};
@@ -254,15 +254,45 @@ fn make_column(cx: &mut Context, title: &str, contents: impl FnOnce(&mut Context
 /// These sit below the four control columns and span the full width, because a node needs four
 /// controls and cramming those into a 330 pixel column would leave them unusably narrow. One row
 /// per node also keeps this section six rows tall instead of twenty-four.
+///
+/// This whole section is temporary scaffolding: it exists so the node maths can be driven and
+/// verified before the nodes become draggable on the analyzer itself, and should go away once
+/// they are.
 fn threshold_eq(cx: &mut Context) {
-    HStack::new(cx, |cx| {
-        threshold_eq_section(cx, "Upwards");
-        threshold_eq_section(cx, "Downwards");
+    let params = Data::params.get(cx);
+
+    // Pairing by ID rather than listing the parameters means adding one to `EqNodeParams` later
+    // cannot silently leave it out of the link
+    let pairs = param_ptr_pairs(
+        &params.compressors.downwards.eq,
+        &params.compressors.upwards.eq,
+    );
+    let link_ptr = param_ptr_by_id(&params.threshold, "eq_link");
+    let is_linked = {
+        let params = params.clone();
+        move || params.threshold.eq_link.value()
+    };
+
+    // NOTE: As with the curve link, the button has to be inside the view that acts on it.
+    ParamLink::new(cx, is_linked, link_ptr, pairs, |cx| {
+        VStack::new(cx, |cx| {
+            ParamButton::new(cx, Data::params, |p| &p.threshold.eq_link)
+                .with_label("Thresh EQ Link")
+                .left(Stretch(1.0))
+                .right(Stretch(1.0));
+
+            HStack::new(cx, |cx| {
+                threshold_eq_section(cx, "Upwards");
+                threshold_eq_section(cx, "Downwards");
+            })
+            .height(Auto)
+            .child_left(Stretch(1.0))
+            .child_right(Stretch(1.0));
+        })
+        .height(Auto);
     })
     .height(Auto)
-    .bottom(Pixels(12.0))
-    .child_left(Stretch(1.0))
-    .child_right(Stretch(1.0));
+    .bottom(Pixels(12.0));
 }
 
 fn threshold_eq_section(cx: &mut Context, direction: &'static str) {
@@ -285,9 +315,11 @@ fn threshold_eq_section(cx: &mut Context, direction: &'static str) {
                     .bottom(Stretch(1.0));
 
                 // A node is inert until its type is set to something other than Off, so the type
-                // comes first and the three values that shape it follow
+                // comes first and the three values that shape it follow. `CurrentStepLabeled`
+                // would overlay all eleven type names on top of each other, so this uses the same
+                // style the generic UI picks for parameters with this many steps.
                 ParamSlider::new(cx, params, move |p| &p.eq.nodes[index].node_type)
-                    .set_style(ParamSliderStyle::CurrentStepLabeled { even: false })
+                    .set_style(ParamSliderStyle::FromLeft)
                     .width(Stretch(1.3));
                 ParamSlider::new(cx, params, move |p| &p.eq.nodes[index].center_frequency)
                     .width(Stretch(1.0));

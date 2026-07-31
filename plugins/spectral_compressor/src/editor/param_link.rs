@@ -19,7 +19,7 @@
 use nih_plug::prelude::*;
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::RawParamEvent;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// A container that keeps pairs of parameters in lockstep while a boolean parameter is enabled.
@@ -182,4 +182,29 @@ pub fn param_ptr_by_id<P: Params>(params: &Arc<P>, id: &str) -> ParamPtr {
         .find(|(param_id, _, _)| param_id == id)
         .map(|(_, param_ptr, _)| param_ptr)
         .unwrap_or_else(|| panic!("No parameter with ID '{id}', this is a bug"))
+}
+
+/// Pair up every parameter of two structurally identical `Params` objects by ID, for use as
+/// [`ParamLink`]'s pairs.
+///
+/// Both objects must be the same type, so the IDs line up exactly and no pair can be missed the
+/// way an explicit list would be when a parameter is added later.
+pub fn param_ptr_pairs<P: Params>(leader: &P, follower: &P) -> Vec<(ParamPtr, ParamPtr)> {
+    let follower_ptrs: HashMap<String, ParamPtr> = follower
+        .param_map()
+        .into_iter()
+        .map(|(id, param_ptr, _)| (id, param_ptr))
+        .collect();
+
+    leader
+        .param_map()
+        .into_iter()
+        .map(|(id, param_ptr, _)| {
+            let follower_ptr = follower_ptrs
+                .get(&id)
+                .unwrap_or_else(|| panic!("No counterpart for parameter '{id}', this is a bug"));
+
+            (param_ptr, *follower_ptr)
+        })
+        .collect()
 }

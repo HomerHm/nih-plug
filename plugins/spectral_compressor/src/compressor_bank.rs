@@ -137,6 +137,11 @@ pub struct ThresholdParams {
     /// visibly show the same number instead of one silently shadowing the other.
     #[id = "thresh_link"]
     pub slope_curve_link: BoolParam,
+    /// The same, but for the two compressors' banks of EQ nodes. This is kept separate from
+    /// [`Self::slope_curve_link`] so the curve's broad tilt and its fine detail can be linked
+    /// independently of each other.
+    #[id = "eq_link"]
+    pub eq_link: BoolParam,
 
     /// Controls the type of threshold that should be used. Check [`ThresholdMode`] for more
     /// information.
@@ -266,6 +271,7 @@ impl ThresholdParams {
             // above the two compressor columns instead of in the threshold column, so it's hidden
             // from the generic UI to avoid showing up twice.
             slope_curve_link: BoolParam::new("Thresh Curve Link", true).hide_in_generic_ui(),
+            eq_link: BoolParam::new("Thresh EQ Link", true).hide_in_generic_ui(),
 
             mode: EnumParam::new("Mode", ThresholdMode::Internal)
                 // Not the most efficient way to do this, but it's a bit cleaner than the
