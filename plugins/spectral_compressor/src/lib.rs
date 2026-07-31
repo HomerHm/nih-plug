@@ -112,9 +112,32 @@ pub struct SpectralCompressorParams {
     pub compressors: compressor_bank::CompressorBankParams,
 }
 
+/// How the two channels relate to each other.
+#[derive(Enum, Debug, PartialEq, Eq)]
+pub enum StereoMode {
+    /// Compress the left and right channels as they are.
+    #[id = "stereo"]
+    #[name = "Left/Right"]
+    LeftRight,
+    /// Convert to mid and side before compressing and back again afterwards, so the centre and
+    /// the sides are compressed independently.
+    #[id = "mid_side"]
+    #[name = "Mid/Side"]
+    MidSide,
+}
+
 /// Global parameters controlling the output stage and all compressors.
 #[derive(Params)]
 pub struct GlobalParams {
+    /// Whether the two channels are compressed as left/right or as mid/side.
+    #[id = "stereo_mode"]
+    pub stereo_mode: EnumParam<StereoMode>,
+    /// How much of the other channel's level to fold into each channel's detection. At 0% the
+    /// channels are detected entirely independently, which is how Spectral Compressor has always
+    /// behaved. At 100% they share one detector, so a loud transient in one channel pulls both
+    /// down by the same amount and the stereo image doesn't shift.
+    #[id = "channel_link"]
+    pub channel_link: FloatParam,
     /// Makeup gain applied after the IDFT in the STFT process. If automatic makeup gain is enabled,
     /// then this acts as an offset on top of that. This is stored as linear gain.
     #[id = "output"]
@@ -188,6 +211,17 @@ impl Default for SpectralCompressor {
 impl Default for GlobalParams {
     fn default() -> Self {
         GlobalParams {
+            stereo_mode: EnumParam::new("Stereo Mode", StereoMode::LeftRight),
+            // Defaults to fully independent, which is the behaviour this plugin has always had
+            channel_link: FloatParam::new(
+                "Channel Link",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_unit("%")
+            .with_value_to_string(formatters::v2s_f32_percentage(0))
+            .with_string_to_value(formatters::s2v_f32_percentage()),
+
             // We don't need any smoothing for these parameters as the overlap-add process will
             // already act as a form of smoothing
             output_gain: FloatParam::new(
@@ -427,8 +461,17 @@ impl Plugin for SpectralCompressor {
         let output_gain = self.params.global.output_gain.value() * gain_compensation.sqrt();
         // TODO: Auto makeup gain
 
-        // This is mixed in later with latency compensation applied
+        // This is mixed in later with latency compensation applied. It has to happen before the
+        // mid/side conversion below so the dry signal stays in left/right.
         self.dry_wet_mixer.write_dry(buffer);
+
+        // The conversion is its own inverse up to a factor of two, and the STFT delays both
+        // channels equally, so encoding what goes in and decoding what comes out lines up even
+        // though those are different samples.
+        let mid_side = self.params.global.stereo_mode.value() == StereoMode::MidSide;
+        if mid_side {
+            convert_mid_side(buffer);
+        }
 
         match self.params.threshold.mode.value() {
             compressor_bank::ThresholdMode::Internal => self.stft.process_overlap_add(
@@ -487,6 +530,10 @@ impl Plugin for SpectralCompressor {
             }
         }
 
+        if mid_side {
+            convert_mid_side(buffer);
+        }
+
         self.dry_wet_mixer.mix_in_dry(
             buffer,
             self.params
@@ -527,6 +574,25 @@ impl SpectralCompressor {
         self.compressor_bank
             .resize(&self.buffer_config, window_size);
         self.compressor_bank.reset();
+    }
+}
+
+/// Convert a stereo buffer between left/right and mid/side, in place.
+///
+/// `mid = (left + right) / 2` and `side = (left - right) / 2` inverts to `left = mid + side` and
+/// `right = mid - side`, so running this twice scales by a half. Both directions therefore use the
+/// same expression with a gain of one, keeping a mid/side round trip unity.
+fn convert_mid_side(buffer: &mut Buffer) {
+    let channels = buffer.as_slice();
+    if channels.len() != 2 {
+        return;
+    }
+
+    let (first, second) = channels.split_at_mut(1);
+    for (left, right) in first[0].iter_mut().zip(second[0].iter_mut()) {
+        let mid = (*left + *right) * std::f32::consts::FRAC_1_SQRT_2;
+        let side = (*left - *right) * std::f32::consts::FRAC_1_SQRT_2;
+        (*left, *right) = (mid, side);
     }
 }
 

@@ -455,7 +455,8 @@ fn node_menu(cx: &mut Context) {
     })
     .position_type(PositionType::SelfDirected)
     .left(Data::node_menu.map(|menu| Pixels(menu.x)))
-    .top(Data::node_menu.map(|menu| Pixels(menu.y)));
+    .top(Data::node_menu.map(|menu| Pixels(menu.y)))
+    .on_blur(|cx| cx.emit(EditorEvent::CloseNodeMenu));
 }
 
 /// A submenu listing every variant of one of a node's enum parameters.

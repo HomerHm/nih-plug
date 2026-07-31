@@ -20,14 +20,24 @@ analyzer {
   color: #161616;
 }
 
-/* The node context menu. Vizia's menus are unstyled by default in this theming mode. */
+/* The node context menu.
+   Under ViziaTheming::Custom none of vizia's own stylesheets are loaded, and a MenuPopup is shown
+   purely by the `:checked` state driving `display`. Without these two rules the popup never
+   appears no matter what its lens says. */
 popup {
   background-color: #2a2a2a;
   border-color: #101010;
   border-radius: 3px;
   border-width: 1px;
-  width: auto;
+  display: none;
   height: auto;
+  opacity: 0;
+  width: auto;
+}
+
+popup:checked {
+  display: flex;
+  opacity: 1;
 }
 
 popup label {

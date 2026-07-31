@@ -104,6 +104,9 @@ pub struct CompressorBank {
     /// back up to 1 after after [`CompressorBank::reset()`] has been called to allow the envelope
     /// followers to settle back in.
     envelope_followers_timing_scale: f32,
+    /// The current block's bin magnitudes for each channel, used to let the channels share their
+    /// detection. Indexed by `[channel_idx][bin_idx]`.
+    spectrum_magnitudes: Vec<Vec<f32>>,
     /// When sidechaining is enabled, this contains the per-channel frqeuency spectrum magnitudes
     /// for the current block. The compressor thresholds and knee values are multiplied by these
     /// values to get the effective thresholds.
@@ -491,6 +494,7 @@ impl CompressorBank {
             upwards_knee_parabola_intercept: Vec::with_capacity(complex_buffer_len),
 
             envelopes: vec![Vec::with_capacity(complex_buffer_len); num_channels],
+            spectrum_magnitudes: vec![Vec::with_capacity(complex_buffer_len); num_channels],
             envelope_followers_timing_scale: 0.0,
             sidechain_spectrum_magnitudes: vec![
                 Vec::with_capacity(complex_buffer_len);
@@ -542,6 +546,11 @@ impl CompressorBank {
             envelopes.reserve_exact(complex_buffer_len.saturating_sub(envelopes.len()));
         }
 
+        self.spectrum_magnitudes.resize_with(num_channels, Vec::new);
+        for magnitudes in self.spectrum_magnitudes.iter_mut() {
+            magnitudes.reserve_exact(complex_buffer_len.saturating_sub(magnitudes.len()));
+        }
+
         self.sidechain_spectrum_magnitudes
             .resize_with(num_channels, Vec::new);
         for magnitudes in self.sidechain_spectrum_magnitudes.iter_mut() {
@@ -590,6 +599,10 @@ impl CompressorBank {
 
         for envelopes in self.envelopes.iter_mut() {
             envelopes.resize(complex_buffer_len, ENVELOPE_INIT_VALUE);
+        }
+
+        for magnitudes in self.spectrum_magnitudes.iter_mut() {
+            magnitudes.resize(complex_buffer_len, 0.0);
         }
 
         for magnitudes in self.sidechain_spectrum_magnitudes.iter_mut() {
@@ -781,13 +794,59 @@ impl CompressorBank {
         };
         let release_new_t = 1.0 - release_old_t;
 
-        for (bin, envelope) in buffer.iter().zip(self.envelopes[channel_idx].iter_mut()) {
-            let magnitude = bin.norm();
+        // Record this channel's magnitudes so the other channels can fold them into their own
+        // detection below
+        for (bin, magnitude) in buffer
+            .iter()
+            .zip(self.spectrum_magnitudes[channel_idx].iter_mut())
+        {
+            *magnitude = bin.norm();
+        }
+
+        let num_channels = self.spectrum_magnitudes.len() as f32;
+        let other_channels_t = params.global.channel_link.value() / num_channels;
+        let this_channel_t = 1.0 - (other_channels_t * (num_channels - 1.0));
+
+        // The common case is fully independent channels, which doesn't need to look at the others
+        // at all
+        if other_channels_t == 0.0 {
+            for (bin, envelope) in buffer.iter().zip(self.envelopes[channel_idx].iter_mut()) {
+                let magnitude = bin.norm();
+                if *envelope > magnitude {
+                    // Release stage
+                    *envelope = (release_old_t * *envelope) + (release_new_t * magnitude);
+                } else {
+                    // Attack stage
+                    *envelope = (attack_old_t * *envelope) + (attack_new_t * magnitude);
+                }
+            }
+
+            return;
+        }
+
+        // NOTE: The channels are processed one after another within a block, so the channels that
+        //       haven't run yet still hold the previous block's magnitudes here. At one STFT hop
+        //       that lag is orders of magnitude shorter than the envelope timings, and avoiding it
+        //       would mean a separate analysis pass over every channel.
+        for (bin_idx, envelope) in self.envelopes[channel_idx].iter_mut().enumerate() {
+            let magnitude: f32 = self
+                .spectrum_magnitudes
+                .iter()
+                .enumerate()
+                .map(|(other_channel_idx, magnitudes)| {
+                    let t = if other_channel_idx == channel_idx {
+                        this_channel_t
+                    } else {
+                        other_channels_t
+                    };
+
+                    unsafe { magnitudes.get_unchecked(bin_idx) * t }
+                })
+                .sum();
+
             if *envelope > magnitude {
-                // Release stage
                 *envelope = (release_old_t * *envelope) + (release_new_t * magnitude);
             } else {
-                // Attack stage
                 *envelope = (attack_old_t * *envelope) + (attack_new_t * magnitude);
             }
         }
