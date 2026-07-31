@@ -15,28 +15,27 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 use atomic_float::AtomicF32;
-use crossbeam::atomic::AtomicCell;
 use nih_plug::prelude::*;
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
-use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
 use self::analyzer::Analyzer;
-use self::mode_button::EditorModeButton;
 use crate::analyzer::AnalyzerData;
 use crate::{SpectralCompressor, SpectralCompressorParams};
 
 mod analyzer;
-mod mode_button;
 
-/// The entire GUI's width, in logical pixels.
-const EXPANDED_GUI_WIDTH: u32 = 1360;
-/// The width of the GUI's main part containing the controls.
-const COLLAPSED_GUI_WIDTH: u32 = 680;
-/// The entire GUI's height, in logical pixels.
-const GUI_HEIGHT: u32 = 530;
+/// The GUI's width, in logical pixels. Wide enough for the four control columns below the
+/// analyzer to sit side by side.
+const GUI_WIDTH: u32 = 1360;
+/// The GUI's height, in logical pixels.
+///
+/// The controls take exactly as much vertical space as they need and the analyzer absorbs whatever
+/// is left over, so this number only sets how much room the analyzer gets. Growing a control
+/// column can therefore never truncate it -- it just eats into the analyzer.
+const GUI_HEIGHT: u32 = 760;
 // I couldn't get `LayoutType::Grid` to work as expected, so we'll fake a 4x4 grid with
 // hardcoded column widths
 const COLUMN_WIDTH: Units = Pixels(330.0);
@@ -60,25 +59,9 @@ fn open_url(url: &str) {
     }
 }
 
-/// The editor's mode. Essentially just a boolean to indicate whether the analyzer is shown or
-/// not.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EditorMode {
-    // These serialization names are hardcoded so the variants can be renamed them later without
-    // breaking preset compatibility
-    #[serde(rename = "collapsed")]
-    Collapsed,
-    #[default]
-    #[serde(rename = "analyzer-visible")]
-    AnalyzerVisible,
-}
-
 #[derive(Clone, Lens)]
 pub struct Data {
     pub(crate) params: Arc<SpectralCompressorParams>,
-
-    /// Determines which parts of the GUI are visible, and in turn decides the GUI's size.
-    pub(crate) editor_mode: Arc<AtomicCell<EditorMode>>,
 
     pub(crate) analyzer_data: Arc<Mutex<triple_buffer::Output<AnalyzerData>>>,
     /// Used by the analyzer to determine which FFT bins belong to which frequencies.
@@ -88,11 +71,8 @@ pub struct Data {
 impl Model for Data {}
 
 // Makes sense to also define this here, makes it a bit easier to keep track of
-pub(crate) fn default_state(editor_mode: Arc<AtomicCell<EditorMode>>) -> Arc<ViziaState> {
-    ViziaState::new(move || match editor_mode.load() {
-        EditorMode::Collapsed => (COLLAPSED_GUI_WIDTH, GUI_HEIGHT),
-        EditorMode::AnalyzerVisible => (EXPANDED_GUI_WIDTH, GUI_HEIGHT),
-    })
+pub(crate) fn default_state() -> Arc<ViziaState> {
+    ViziaState::new(|| (GUI_WIDTH, GUI_HEIGHT))
 }
 
 pub(crate) fn create(editor_state: Arc<ViziaState>, editor_data: Data) -> Option<Box<dyn Editor>> {
@@ -106,141 +86,109 @@ pub(crate) fn create(editor_state: Arc<ViziaState>, editor_data: Data) -> Option
 
         editor_data.clone().build(cx);
 
-        HStack::new(cx, |cx| {
-            main_column(cx);
-
-            let analyzer_visible = Data::editor_mode
-                .map(|editor_mode| editor_mode.load() == EditorMode::AnalyzerVisible);
-            Binding::new(cx, analyzer_visible, |cx, analyzer_visible| {
-                if analyzer_visible.get(cx) {
-                    analyzer_column(cx);
-                }
-            });
-        });
+        VStack::new(cx, |cx| {
+            title_bar(cx);
+            // `Stretch` here is what keeps the controls below from ever being clipped: they take
+            // their natural height first and the analyzer gets the remainder.
+            analyzer(cx);
+            controls(cx);
+        })
+        .row_between(Pixels(10.0));
 
         ResizeHandle::new(cx);
     })
 }
 
-fn main_column(cx: &mut Context) {
-    VStack::new(cx, |cx| {
-        HStack::new(cx, |cx| {
-            EditorModeButton::new(cx, Data::editor_mode, "Show analyzer")
-                // Makes this align a bit nicer with the plugin name
-                .top(Pixels(2.0))
-                .left(Pixels(2.0));
-
-            HStack::new(cx, |cx| {
-                Label::new(cx, "Spectral Compressor")
-                    .font_family(vec![FamilyOwned::Name(String::from(assets::NOTO_SANS))])
-                    .font_weight(FontWeightKeyword::Thin)
-                    .font_size(30.0)
-                    // Clicking the title opens the original project's page
-                    .on_mouse_down(|_, _| open_url(SpectralCompressor::URL));
-                Label::new(cx, SpectralCompressor::VERSION)
-                    .color(DARKER_GRAY)
-                    .top(Stretch(1.0))
-                    .bottom(Pixels(4.0))
-                    .left(Pixels(2.0));
-                // GPL requires modified versions to be marked as such. This also doubles as the
-                // link to this fork, so the title above can keep pointing at the original.
-                Label::new(cx, "Mod by HomerHm")
-                    .color(DARKER_GRAY)
-                    .font_size(11.0)
-                    .top(Stretch(1.0))
-                    .bottom(Pixels(5.0))
-                    .left(Pixels(8.0))
-                    .on_mouse_down(|_, _| open_url(MOD_URL));
-            })
-            .size(Auto);
-        })
-        .height(Pixels(30.0))
-        .right(Pixels(17.0))
-        // Somehow this overrides the 'row-between' value now
-        .bottom(Pixels(8.0))
-        .left(Pixels(10.0))
-        .top(Pixels(10.0))
-        // This contains the editor mode buttom all the way on the left, and the plugin's name all the way on the right
-        .col_between(Stretch(1.0));
-
-        HStack::new(cx, |cx| {
-            make_column(cx, "Globals", |cx| {
-                GenericUi::new(cx, Data::params.map(|p| p.global.clone()));
-            });
-
-            make_column(cx, "Threshold", |cx| {
-                GenericUi::new(cx, Data::params.map(|p| p.threshold.clone()));
-
-                Label::new(
-                    cx,
-                    "Parameter ranges and overal gain staging are still subject to change. If you \
-                     use this in a project, make sure to bounce things to audio just in case \
-                     they'll sound different later.",
-                )
-                .text_wrap(true)
-                .font_size(11.0)
-                .left(Pixels(15.0))
-                .right(Pixels(8.0))
-                .width(Stretch(1.0));
-            });
-        })
-        .size(Auto);
-
-        HStack::new(cx, |cx| {
-            make_column(cx, "Upwards", |cx| {
-                // We don't want to show the 'Upwards' prefix here, but it should still be in
-                // the parameter name so the parameter list makes sense
-                let upwards_compressor_params = Data::params.map(|p| p.compressors.upwards.clone());
-                GenericUi::new_custom(cx, upwards_compressor_params, |cx, param_ptr| {
-                    HStack::new(cx, |cx| {
-                        Label::new(
-                            cx,
-                            unsafe { param_ptr.name() }
-                                .strip_prefix("Upwards ")
-                                .expect("Expected parameter name prefix, this is a bug"),
-                        )
-                        .class("label");
-
-                        GenericUi::draw_widget(cx, upwards_compressor_params, param_ptr);
-                    })
-                    .class("row");
-                });
-            });
-
-            make_column(cx, "Downwards", |cx| {
-                let downwards_compressor_params =
-                    Data::params.map(|p| p.compressors.downwards.clone());
-                GenericUi::new_custom(cx, downwards_compressor_params, |cx, param_ptr| {
-                    HStack::new(cx, |cx| {
-                        Label::new(
-                            cx,
-                            unsafe { param_ptr.name() }
-                                .strip_prefix("Downwards ")
-                                .expect("Expected parameter name prefix, this is a bug"),
-                        )
-                        .class("label");
-
-                        GenericUi::draw_widget(cx, downwards_compressor_params, param_ptr);
-                    })
-                    .class("row");
-                });
-            });
-        })
-        .size(Auto);
+fn title_bar(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        Label::new(cx, "Spectral Compressor")
+            .font_family(vec![FamilyOwned::Name(String::from(assets::NOTO_SANS))])
+            .font_weight(FontWeightKeyword::Thin)
+            .font_size(30.0)
+            // Clicking the title opens the original project's page
+            .on_mouse_down(|_, _| open_url(SpectralCompressor::URL));
+        Label::new(cx, SpectralCompressor::VERSION)
+            .color(DARKER_GRAY)
+            .top(Stretch(1.0))
+            .bottom(Pixels(4.0))
+            .left(Pixels(2.0));
+        // GPL requires modified versions to be marked as such. This also doubles as the
+        // link to this fork, so the title above can keep pointing at the original.
+        Label::new(cx, "Mod by HomerHm")
+            .color(DARKER_GRAY)
+            .font_size(11.0)
+            .top(Stretch(1.0))
+            .bottom(Pixels(5.0))
+            .left(Pixels(8.0))
+            .on_mouse_down(|_, _| open_url(MOD_URL));
     })
-    .width(Pixels(COLLAPSED_GUI_WIDTH as f32))
-    .row_between(Pixels(10.0))
-    .child_left(Stretch(1.0))
-    .child_right(Stretch(1.0));
+    .height(Pixels(30.0))
+    .left(Pixels(12.0))
+    .top(Pixels(10.0));
 }
 
-fn analyzer_column(cx: &mut Context) {
+fn analyzer(cx: &mut Context) {
     Analyzer::new(cx, Data::analyzer_data, Data::sample_rate)
-        // These arbitrary 12 pixels are to align with the analyzer toggle botton
-        .space(Pixels(12.0))
-        .bottom(Pixels(12.0))
-        .left(Pixels(2.0))
-        .top(Pixels(12.0));
+        // Soaks up all vertical space the controls below don't need
+        .height(Stretch(1.0))
+        .left(Pixels(12.0))
+        .right(Pixels(12.0));
+}
+
+fn controls(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        make_column(cx, "Globals", |cx| {
+            GenericUi::new(cx, Data::params.map(|p| p.global.clone()));
+        });
+
+        make_column(cx, "Threshold", |cx| {
+            GenericUi::new(cx, Data::params.map(|p| p.threshold.clone()));
+        });
+
+        make_column(cx, "Upwards", |cx| {
+            // We don't want to show the 'Upwards' prefix here, but it should still be in
+            // the parameter name so the parameter list makes sense
+            let upwards_compressor_params = Data::params.map(|p| p.compressors.upwards.clone());
+            GenericUi::new_custom(cx, upwards_compressor_params, |cx, param_ptr| {
+                HStack::new(cx, |cx| {
+                    Label::new(
+                        cx,
+                        unsafe { param_ptr.name() }
+                            .strip_prefix("Upwards ")
+                            .expect("Expected parameter name prefix, this is a bug"),
+                    )
+                    .class("label");
+
+                    GenericUi::draw_widget(cx, upwards_compressor_params, param_ptr);
+                })
+                .class("row");
+            });
+        });
+
+        make_column(cx, "Downwards", |cx| {
+            let downwards_compressor_params = Data::params.map(|p| p.compressors.downwards.clone());
+            GenericUi::new_custom(cx, downwards_compressor_params, |cx, param_ptr| {
+                HStack::new(cx, |cx| {
+                    Label::new(
+                        cx,
+                        unsafe { param_ptr.name() }
+                            .strip_prefix("Downwards ")
+                            .expect("Expected parameter name prefix, this is a bug"),
+                    )
+                    .class("label");
+
+                    GenericUi::draw_widget(cx, downwards_compressor_params, param_ptr);
+                })
+                .class("row");
+            });
+        });
+    })
+    // Auto means this row is exactly as tall as its tallest column, so adding parameters makes
+    // the window's analyzer shrink rather than pushing controls out of view
+    .height(Auto)
+    .bottom(Pixels(12.0))
+    .child_left(Stretch(1.0))
+    .child_right(Stretch(1.0));
 }
 
 fn make_column(cx: &mut Context, title: &str, contents: impl FnOnce(&mut Context)) {
