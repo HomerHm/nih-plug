@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::analyzer::AnalyzerData;
 use crate::curve::{Curve, CurveParams};
-use crate::eq_curve::{EqCurve, EqCurveParams};
+use crate::eq_curve::{EqCurve, EqCurveParams, EqNodeType};
 
 // We'll show the bins from 30 Hz (to your chest) to 22 kHz, scaled logarithmically
 #[allow(unused)]
@@ -33,6 +33,37 @@ const FREQ_RANGE_END_HZ: f32 = 22_000.0;
 const LN_FREQ_RANGE_START_HZ: f32 = 3.4011974; // 30.0f32.ln();
 const LN_FREQ_RANGE_END_HZ: f32 = 9.998797; // 22_000.0f32.ln();
 const LN_FREQ_RANGE: f32 = LN_FREQ_RANGE_END_HZ - LN_FREQ_RANGE_START_HZ;
+
+/// The frequencies that get a gridline and a label underneath the analyzer.
+pub(crate) const FREQUENCY_TICKS: &[f32] = &[
+    50.0, 100.0, 200.0, 500.0, 1_000.0, 2_000.0, 5_000.0, 10_000.0, 20_000.0,
+];
+
+/// The decibel values that get a horizontal gridline. These are thresholds, not signal levels.
+const DB_TICKS: &[f32] = &[-60.0, -40.0, -20.0, 0.0];
+
+/// Where a frequency sits horizontally, as a `[0, 1]` fraction of the analyzer's width.
+///
+/// The label row in the editor uses this same function, so the labels cannot drift out of
+/// alignment with the gridlines drawn here.
+pub(crate) fn frequency_to_t(frequency: f32) -> f32 {
+    (frequency.ln() - LN_FREQ_RANGE_START_HZ) / LN_FREQ_RANGE
+}
+
+/// Render a tick frequency the way it's usually written on an analyzer.
+pub(crate) fn format_frequency(frequency: f32) -> String {
+    if frequency >= 1000.0 {
+        format!("{:.0}k", frequency / 1000.0)
+    } else {
+        format!("{frequency:.0}")
+    }
+}
+
+/// The color of the gridlines. Kept dim so the spectrum stays the thing you look at.
+const GRID_COLOR: vg::Color = vg::Color::rgbaf(0.35, 0.35, 0.35, 0.35);
+
+/// The radius of a node's handle, in logical pixels.
+const NODE_RADIUS: f32 = 5.0;
 
 /// The color used for drawing the overlay. Currently not configurable using the style sheet (that
 /// would be possible by moving this to a dedicated view and overlaying that).
@@ -96,10 +127,11 @@ impl View for Analyzer {
         let analyzer_data = analyzer_data.read();
         let nyquist = self.sample_rate.load(Ordering::Relaxed) / 2.0;
 
+        draw_grid(cx, canvas);
         draw_spectrum(cx, canvas, analyzer_data, nyquist);
         draw_threshold_curve(cx, canvas, analyzer_data);
+        draw_nodes(cx, canvas, analyzer_data);
         draw_gain_reduction(cx, canvas, analyzer_data, nyquist);
-        // TODO: Display the frequency range below the graph
 
         // Draw the border last
         let border_width = cx.border_width();
@@ -255,6 +287,102 @@ fn draw_spectrum(
     // NOTE:  This is very important, otherwise this looks all kinds of gnarly
     .with_anti_alias(false);
     canvas.fill_path(&mesh_path, &mesh_paint);
+}
+
+/// Draw the frequency and decibel gridlines. This goes underneath everything else so it reads as
+/// background rather than as data.
+fn draw_grid(cx: &mut DrawContext, canvas: &mut Canvas) {
+    let bounds = cx.bounds();
+    let paint = vg::Paint::color(GRID_COLOR).with_line_width(cx.scale_factor());
+
+    let mut path = vg::Path::new();
+    for frequency in FREQUENCY_TICKS {
+        let t = frequency_to_t(*frequency);
+        if !(0.0..=1.0).contains(&t) {
+            continue;
+        }
+
+        let x = bounds.x + (bounds.w * t);
+        path.move_to(x, bounds.y);
+        path.line_to(x, bounds.y + bounds.h);
+    }
+
+    for db in DB_TICKS {
+        let t = db_to_unclamped_t(*db);
+        if !(0.0..=1.0).contains(&t) {
+            continue;
+        }
+
+        // This axis increases from bottom to top
+        let y = bounds.y + (bounds.h * (1.0 - t));
+        path.move_to(bounds.x, y);
+        path.line_to(bounds.x + bounds.w, y);
+    }
+
+    canvas.stroke_path(&path, &paint);
+}
+
+/// Draw a handle on each active EQ node, sitting on the curve it belongs to.
+///
+/// The handles are placed by evaluating the same curve that gets drawn, so a node's handle always
+/// sits exactly on its own curve rather than near it.
+fn draw_nodes(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data: &AnalyzerData) {
+    let bounds = cx.bounds();
+    let scale_factor = cx.scale_factor();
+
+    let (upwards_offset_db, downwards_offset_db) = analyzer_data.curve_offsets_db;
+    let curves = [
+        (
+            &analyzer_data.upwards_curve_params,
+            &analyzer_data.upwards_eq_params,
+            upwards_offset_db,
+            UPWARDS_THRESHOLD_CURVE_COLOR,
+        ),
+        (
+            &analyzer_data.downwards_curve_params,
+            &analyzer_data.downwards_eq_params,
+            downwards_offset_db,
+            DOWNWARDS_THRESHOLD_CURVE_COLOR,
+        ),
+    ];
+
+    canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
+    for (curve_params, eq_params, offset_db, color) in curves {
+        let curve = Curve::new(curve_params);
+        let eq_curve = EqCurve::new(eq_params);
+
+        for node in &eq_params.nodes {
+            if node.node_type == EqNodeType::Off {
+                continue;
+            }
+
+            let t = frequency_to_t(node.center_frequency);
+            if !(0.0..=1.0).contains(&t) {
+                continue;
+            }
+
+            let y_db = curve.evaluate_ln(node.center_frequency.ln())
+                + eq_curve.evaluate_db(node.center_frequency)
+                + offset_db;
+            let y_t = db_to_unclamped_t(y_db);
+
+            let x = bounds.x + (bounds.w * t);
+            let y = bounds.y + (bounds.h * (1.0 - y_t));
+
+            let mut path = vg::Path::new();
+            path.circle(x, y, NODE_RADIUS * scale_factor);
+
+            // A filled center with a ring around it stays legible against both the dark background
+            // and the bright spectrum
+            canvas.fill_path(&path, &vg::Paint::color(color));
+            canvas.stroke_path(
+                &path,
+                &vg::Paint::color(vg::Color::rgbaf(0.05, 0.05, 0.05, 0.9))
+                    .with_line_width(1.5 * scale_factor),
+            );
+        }
+    }
+    canvas.reset_scissor();
 }
 
 /// Overlays the threshold curves over the spectrum analyzer. The upwards and downwards curves can

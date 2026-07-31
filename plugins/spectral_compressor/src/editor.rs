@@ -21,7 +21,7 @@ use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use std::sync::{Arc, Mutex};
 
-use self::analyzer::Analyzer;
+use self::analyzer::{format_frequency, frequency_to_t, Analyzer, FREQUENCY_TICKS};
 use self::param_link::{param_ptr_by_id, param_ptr_pairs, ParamLink};
 use crate::analyzer::AnalyzerData;
 use crate::eq_curve::MAX_EQ_NODES;
@@ -132,11 +132,47 @@ fn title_bar(cx: &mut Context) {
 }
 
 fn analyzer(cx: &mut Context) {
-    Analyzer::new(cx, Data::analyzer_data, Data::sample_rate)
-        // Soaks up all vertical space the controls below don't need
-        .height(Stretch(1.0))
-        .left(Pixels(12.0))
-        .right(Pixels(12.0));
+    VStack::new(cx, |cx| {
+        Analyzer::new(cx, Data::analyzer_data, Data::sample_rate)
+            // Soaks up all vertical space the controls below don't need
+            .height(Stretch(1.0));
+
+        frequency_scale(cx);
+    })
+    .height(Stretch(1.0))
+    .left(Pixels(12.0))
+    .right(Pixels(12.0));
+}
+
+/// The frequency labels underneath the analyzer.
+///
+/// Text can't be drawn onto the canvas from outside vizia, so these are real labels positioned
+/// over the analyzer's width. They share [`analyzer::frequency_to_t`] with the gridlines, so the
+/// two cannot drift apart.
+fn frequency_scale(cx: &mut Context) {
+    // Wide enough for a label to stay centred on its gridline without being clipped
+    const LABEL_WIDTH_PCT: f32 = 10.0;
+
+    ZStack::new(cx, |cx| {
+        for frequency in FREQUENCY_TICKS {
+            let t = frequency_to_t(*frequency);
+            if !(0.0..=1.0).contains(&t) {
+                continue;
+            }
+
+            ZStack::new(cx, |cx| {
+                Label::new(cx, &format_frequency(*frequency))
+                    .font_size(11.0)
+                    .color(DARKER_GRAY);
+            })
+            .left(Percentage((t * 100.0) - (LABEL_WIDTH_PCT / 2.0)))
+            .width(Percentage(LABEL_WIDTH_PCT))
+            .child_left(Stretch(1.0))
+            .child_right(Stretch(1.0));
+        }
+    })
+    .height(Pixels(16.0))
+    .top(Pixels(2.0));
 }
 
 fn controls(cx: &mut Context) {
