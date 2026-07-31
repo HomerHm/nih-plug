@@ -21,10 +21,11 @@ use nih_plug_vizia::vizia::vg;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use super::EditedDirection;
+use super::EditorEvent;
 use crate::analyzer::AnalyzerData;
 use crate::curve::{Curve, CurveParams};
-use crate::eq_curve::{EqBankParams, EqCurve, EqCurveParams, EqNodeType};
+use crate::eq_curve::CompressorDirection;
+use crate::eq_curve::{EqBankParams, EqCurve, EqNodeTarget, EqNodeType};
 use crate::SpectralCompressorParams;
 use nih_plug::prelude::{Enum, Param, ParamPtr};
 use nih_plug_vizia::widgets::RawParamEvent;
@@ -129,7 +130,7 @@ pub struct Analyzer<L> {
 /// the cursor.
 struct NodeDrag {
     node_index: usize,
-    direction: EditedDirection,
+    direction: CompressorDirection,
     start_frequency: f32,
     start_gain_db: f32,
     start_cursor: (f32, f32),
@@ -137,7 +138,7 @@ struct NodeDrag {
 
 impl<L> Analyzer<L>
 where
-    L: Lens<Target = EditedDirection>,
+    L: Lens<Target = CompressorDirection>,
 {
     /// Creates a new [`Analyzer`].
     pub fn new<LAnalyzerData, LRate, LParams>(
@@ -166,42 +167,65 @@ where
         )
     }
 
-    /// The bank of nodes belonging to `direction`.
-    fn nodes(&self, direction: EditedDirection) -> &EqBankParams {
-        match direction {
-            EditedDirection::Upwards => &self.params.compressors.upwards.eq,
-            EditedDirection::Downwards => &self.params.compressors.downwards.eq,
-        }
+    /// The shared bank of nodes. Which curve a node deforms is its own `target` parameter.
+    fn nodes(&self) -> &EqBankParams {
+        &self.params.threshold.eq
     }
 
     /// Where a node's handle is drawn, as `[0, 1]` fractions of the analyzer's bounds. Mirrors
     /// what [`draw_nodes()`] does, so hit testing and drawing cannot disagree.
-    fn node_position_t(&self, direction: EditedDirection, node_index: usize) -> (f32, f32) {
+    /// Where each active node's handle is drawn, as `[0, 1]` fractions of the analyzer's bounds.
+    ///
+    /// Mirrors what [`draw_nodes()`] does, so hit testing and drawing cannot disagree about where
+    /// a node is. The composite curve is built once for the whole bank rather than once per node,
+    /// which matters because this runs on every click and scroll.
+    fn node_positions_t(&self, direction: CompressorDirection) -> Vec<(usize, f32, f32)> {
         let compressor = match direction {
-            EditedDirection::Upwards => &self.params.compressors.upwards,
-            EditedDirection::Downwards => &self.params.compressors.downwards,
+            CompressorDirection::Upwards => &self.params.compressors.upwards,
+            CompressorDirection::Downwards => &self.params.compressors.downwards,
         };
-        let node = compressor.eq.nodes[node_index].snapshot();
 
         let curve_params = self.params.threshold.curve_params(compressor);
         let curve = Curve::new(&curve_params);
-        let eq_curve = EqCurve::new(&compressor.eq.snapshot());
+        let eq_params = self.nodes().snapshot();
+        let eq_curve = EqCurve::new(&eq_params, direction);
+        let offset_db = compressor.threshold_offset_db.value();
 
-        let y_db = curve.evaluate_ln(node.center_frequency.ln())
-            + eq_curve.evaluate_db(node.center_frequency)
-            + compressor.threshold_offset_db.value();
+        // Only nodes that deform this curve get a handle on it, so a node assigned to the other
+        // compressor can't be grabbed here
+        eq_params
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                node.node_type != EqNodeType::Off && node.target.applies_to(direction)
+            })
+            .map(|(index, node)| {
+                let y_db = curve.evaluate_ln(node.center_frequency.ln())
+                    + eq_curve.evaluate_db(node.center_frequency)
+                    + offset_db;
 
-        (
-            frequency_to_t(node.center_frequency),
-            1.0 - db_to_unclamped_t(y_db),
-        )
+                (
+                    index,
+                    frequency_to_t(node.center_frequency),
+                    1.0 - db_to_unclamped_t(y_db),
+                )
+            })
+            .collect()
+    }
+
+    /// The parameters a drag moves: the node's frequency and its gain.
+    fn drag_param_ptrs(&self, node_index: usize) -> (ParamPtr, ParamPtr) {
+        let node = &self.nodes().nodes[node_index];
+
+        (node.center_frequency.as_ptr(), node.gain_db.as_ptr())
     }
 
     /// The active node whose handle is under `(x, y)`, if any.
     fn node_at(
         &self,
         cx: &EventContext,
-        direction: EditedDirection,
+        direction: CompressorDirection,
         x: f32,
         y: f32,
     ) -> Option<usize> {
@@ -209,12 +233,7 @@ where
         let radius = NODE_RADIUS * cx.scale_factor() * 2.0;
 
         let mut closest: Option<(usize, f32)> = None;
-        for (index, node) in self.nodes(direction).nodes.iter().enumerate() {
-            if node.node_type.value() == EqNodeType::Off {
-                continue;
-            }
-
-            let (t_x, t_y) = self.node_position_t(direction, index);
+        for (index, t_x, t_y) in self.node_positions_t(direction) {
             let dx = (bounds.x + (bounds.w * t_x)) - x;
             let dy = (bounds.y + (bounds.h * t_y)) - y;
             let distance_squared = (dx * dx) + (dy * dy);
@@ -231,8 +250,8 @@ where
     }
 
     /// The first switched-off node, which is the one a double click turns on.
-    fn first_free_node(&self, direction: EditedDirection) -> Option<usize> {
-        self.nodes(direction)
+    fn first_free_node(&self) -> Option<usize> {
+        self.nodes()
             .nodes
             .iter()
             .position(|node| node.node_type.value() == EqNodeType::Off)
@@ -241,21 +260,46 @@ where
 
 /// Set a parameter as a complete one-off gesture.
 ///
-/// These are the same events a slider emits, so edits made on the graph are mirrored by the link
-/// views and recorded by the host exactly like edits made with the sliders.
+/// Only for discrete edits. A drag must not use this: `BeginSetParameter` and `EndSetParameter`
+/// tell the host an automation gesture started and finished, and hosts typically record an undo
+/// entry for each one. Emitting a full gesture per mouse move floods them badly enough to stall
+/// the editor. Use [`begin_gesture()`], [`set_param_value()`] and [`end_gesture()`] instead, which
+/// is what a slider does.
 fn set_param(cx: &mut EventContext, param_ptr: ParamPtr, plain_value: f32) {
+    begin_gesture(cx, param_ptr);
+    set_param_value(cx, param_ptr, plain_value);
+    end_gesture(cx, param_ptr);
+}
+
+/// Tell the host an automation gesture is starting. Must be matched by [`end_gesture()`].
+fn begin_gesture(cx: &mut EventContext, param_ptr: ParamPtr) {
+    cx.emit(RawParamEvent::BeginSetParameter(param_ptr));
+}
+
+/// Set a parameter's value within an already-started gesture.
+///
+/// Unchanged values are dropped, so holding the mouse still during a drag costs nothing.
+fn set_param_value(cx: &mut EventContext, param_ptr: ParamPtr, plain_value: f32) {
     // SAFETY: The pointer comes from the params object owned by the editor's data, which outlives
     //         this view.
-    let normalized = unsafe { param_ptr.preview_normalized(plain_value) };
+    unsafe {
+        let normalized = param_ptr.preview_normalized(plain_value);
+        if param_ptr.preview_plain(normalized) == param_ptr.unmodulated_plain_value() {
+            return;
+        }
 
-    cx.emit(RawParamEvent::BeginSetParameter(param_ptr));
-    cx.emit(RawParamEvent::SetParameterNormalized(param_ptr, normalized));
+        cx.emit(RawParamEvent::SetParameterNormalized(param_ptr, normalized));
+    }
+}
+
+/// Tell the host the gesture started by [`begin_gesture()`] has finished.
+fn end_gesture(cx: &mut EventContext, param_ptr: ParamPtr) {
     cx.emit(RawParamEvent::EndSetParameter(param_ptr));
 }
 
 impl<L> View for Analyzer<L>
 where
-    L: 'static + Lens<Target = EditedDirection>,
+    L: 'static + Lens<Target = CompressorDirection>,
 {
     fn element(&self) -> Option<&'static str> {
         Some("analyzer")
@@ -268,7 +312,13 @@ where
             WindowEvent::MouseDown(MouseButton::Left) => {
                 let (x, y) = (cx.mouse().cursorx, cx.mouse().cursory);
                 if let Some(node_index) = self.node_at(cx, direction, x, y) {
-                    let node = self.nodes(direction).nodes[node_index].snapshot();
+                    let node = self.nodes().nodes[node_index].snapshot();
+                    let (frequency_ptr, gain_ptr) = self.drag_param_ptrs(node_index);
+
+                    // One gesture spanning the whole drag, rather than one per mouse move
+                    begin_gesture(cx, frequency_ptr);
+                    begin_gesture(cx, gain_ptr);
+
                     self.drag = Some(NodeDrag {
                         node_index,
                         direction,
@@ -283,7 +333,11 @@ where
                 }
             }
             WindowEvent::MouseUp(MouseButton::Left) => {
-                if self.drag.take().is_some() {
+                if let Some(drag) = self.drag.take() {
+                    let (frequency_ptr, gain_ptr) = self.drag_param_ptrs(drag.node_index);
+                    end_gesture(cx, frequency_ptr);
+                    end_gesture(cx, gain_ptr);
+
                     cx.release();
                     cx.set_active(false);
                     meta.consume();
@@ -306,9 +360,9 @@ where
                 let gain_db =
                     drag.start_gain_db - (((y - drag.start_cursor.1) / bounds.h) * DB_RANGE);
 
-                let node = &self.nodes(drag.direction).nodes[drag.node_index];
-                set_param(cx, param_ptr(&node.center_frequency), ln_frequency.exp());
-                set_param(cx, param_ptr(&node.gain_db), gain_db);
+                let (frequency_ptr, gain_ptr) = self.drag_param_ptrs(drag.node_index);
+                set_param_value(cx, frequency_ptr, ln_frequency.exp());
+                set_param_value(cx, gain_ptr, gain_db);
 
                 meta.consume();
             }
@@ -320,9 +374,9 @@ where
 
                 // Scrolling over a handle adjusts its Q. Multiplying rather than adding keeps the
                 // steps feeling even across the parameter's skewed range.
-                let node = &self.nodes(direction).nodes[node_index];
+                let node = &self.nodes().nodes[node_index];
                 let q = node.q.value() * SCROLL_Q_FACTOR.powf(*scroll_y);
-                set_param(cx, param_ptr(&node.q), q);
+                set_param(cx, node.q.as_ptr(), q);
 
                 meta.consume();
             }
@@ -331,10 +385,10 @@ where
 
                 // Double clicking an existing node switches it off, which is how it gets deleted
                 if let Some(node_index) = self.node_at(cx, direction, x, y) {
-                    let node = &self.nodes(direction).nodes[node_index];
+                    let node = &self.nodes().nodes[node_index];
                     set_param(
                         cx,
-                        param_ptr(&node.node_type),
+                        node.node_type.as_ptr(),
                         EqNodeType::Off.to_index() as f32,
                     );
 
@@ -347,7 +401,7 @@ where
                 }
 
                 // Otherwise it creates one at the pointer, if there's a spare
-                let Some(node_index) = self.first_free_node(direction) else {
+                let Some(node_index) = self.first_free_node() else {
                     return;
                 };
                 let bounds = cx.bounds();
@@ -358,12 +412,12 @@ where
                 let t = ((x - bounds.x) / bounds.w).clamp(0.0, 1.0);
                 let frequency = (LN_FREQ_RANGE_START_HZ + (LN_FREQ_RANGE * t)).exp();
 
-                let node = &self.nodes(direction).nodes[node_index];
-                set_param(cx, param_ptr(&node.center_frequency), frequency);
-                set_param(cx, param_ptr(&node.gain_db), 0.0);
+                let node = &self.nodes().nodes[node_index];
+                set_param(cx, node.center_frequency.as_ptr(), frequency);
+                set_param(cx, node.gain_db.as_ptr(), 0.0);
                 set_param(
                     cx,
-                    param_ptr(&node.node_type),
+                    node.node_type.as_ptr(),
                     EqNodeType::Bell.to_index() as f32,
                 );
 
@@ -619,7 +673,7 @@ fn draw_nodes(
     cx: &mut DrawContext,
     canvas: &mut Canvas,
     analyzer_data: &AnalyzerData,
-    edited_direction: EditedDirection,
+    edited_direction: CompressorDirection,
 ) {
     let bounds = cx.bounds();
     let scale_factor = cx.scale_factor();
@@ -628,17 +682,17 @@ fn draw_nodes(
     let mut curves = [
         (
             &analyzer_data.upwards_curve_params,
-            &analyzer_data.upwards_eq_params,
+            &analyzer_data.eq_params,
             upwards_offset_db,
             UPWARDS_THRESHOLD_CURVE_COLOR,
-            EditedDirection::Upwards,
+            CompressorDirection::Upwards,
         ),
         (
             &analyzer_data.downwards_curve_params,
-            &analyzer_data.downwards_eq_params,
+            &analyzer_data.eq_params,
             downwards_offset_db,
             DOWNWARDS_THRESHOLD_CURVE_COLOR,
-            EditedDirection::Downwards,
+            CompressorDirection::Downwards,
         ),
     ];
     // Drawing the edited curve's handles last keeps them on top where they can be grabbed
@@ -650,7 +704,7 @@ fn draw_nodes(
     for (curve_params, eq_params, offset_db, color, direction) in curves {
         let color = curve_color(color, direction == edited_direction);
         let curve = Curve::new(curve_params);
-        let eq_curve = EqCurve::new(eq_params);
+        let eq_curve = EqCurve::new(eq_params, direction);
 
         for node in &eq_params.nodes {
             if node.node_type == EqNodeType::Off {
@@ -692,19 +746,19 @@ fn draw_threshold_curve(
     cx: &mut DrawContext,
     canvas: &mut Canvas,
     analyzer_data: &AnalyzerData,
-    edited_direction: EditedDirection,
+    edited_direction: CompressorDirection,
 ) {
     let bounds = cx.bounds();
 
     let line_width = cx.scale_factor() * 3.0;
     let downwards_paint = vg::Paint::color(curve_color(
         DOWNWARDS_THRESHOLD_CURVE_COLOR,
-        edited_direction == EditedDirection::Downwards,
+        edited_direction == CompressorDirection::Downwards,
     ))
     .with_line_width(line_width);
     let upwards_paint = vg::Paint::color(curve_color(
         UPWARDS_THRESHOLD_CURVE_COLOR,
-        edited_direction == EditedDirection::Upwards,
+        edited_direction == CompressorDirection::Upwards,
     ))
     .with_line_width(line_width);
 
@@ -714,11 +768,12 @@ fn draw_threshold_curve(
     let num_points = 100.min(bounds.w.ceil() as usize);
 
     let mut draw_curve = |curve_params: &CurveParams,
-                          eq_params: &EqCurveParams,
+                          direction: CompressorDirection,
                           offset_db: f32,
                           paint: vg::Paint| {
         let curve = Curve::new(curve_params);
-        let eq_curve = EqCurve::new(eq_params);
+        // One shared bank, filtered down to the nodes assigned to this compressor
+        let eq_curve = EqCurve::new(&analyzer_data.eq_params, direction);
 
         let mut path = vg::Path::new();
         for i in 0..num_points {
@@ -752,13 +807,13 @@ fn draw_threshold_curve(
     let (upwards_offset_db, downwards_offset_db) = analyzer_data.curve_offsets_db;
     draw_curve(
         &analyzer_data.upwards_curve_params,
-        &analyzer_data.upwards_eq_params,
+        CompressorDirection::Upwards,
         upwards_offset_db,
         upwards_paint,
     );
     draw_curve(
         &analyzer_data.downwards_curve_params,
-        &analyzer_data.downwards_eq_params,
+        CompressorDirection::Downwards,
         downwards_offset_db,
         downwards_paint,
     );
@@ -830,12 +885,4 @@ fn draw_gain_reduction(
         .global_composite_blend_func(vg::BlendFactor::DstAlpha, vg::BlendFactor::OneMinusDstColor);
     canvas.fill_path(&path, &paint);
     canvas.global_composite_blend_func(vg::BlendFactor::One, vg::BlendFactor::OneMinusSrcAlpha);
-}
-
-/// A raw pointer to a parameter, for emitting gestures against it.
-///
-/// The parameters live in the params object held by the editor's data, which outlives every view
-/// here, so these pointers stay valid for as long as they're used.
-fn param_ptr<P: Param>(param: &P) -> ParamPtr {
-    param.as_ptr()
 }

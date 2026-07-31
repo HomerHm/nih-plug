@@ -34,11 +34,11 @@ pub struct AnalyzerData {
     /// The same, but for the upwards compressors. Equal to `downwards_curve_params` while the two
     /// curves are linked, in which case the two drawn curves only differ by their offsets.
     pub upwards_curve_params: CurveParams,
-    /// The EQ nodes deforming each threshold curve. The editor rebuilds the same curve the
+    /// The EQ nodes deforming the threshold curves. The editor rebuilds the same curves the
     /// compressors use from these rather than being sent the evaluated thresholds, which keeps
-    /// this struct small and the drawn curve exact.
-    pub downwards_eq_params: EqCurveParams,
-    pub upwards_eq_params: EqCurveParams,
+    /// this struct small and the drawn curves exact. Each node carries the compressors it applies
+    /// to, so one bank covers both.
+    pub eq_params: EqCurveParams,
     /// The upwards and downwards threshold offsets for the curve. These are used to draw the curve
     /// twice with some distance between them if either is non-zero.
     pub curve_offsets_db: (f32, f32),
@@ -66,8 +66,7 @@ impl Default for AnalyzerData {
         Self {
             downwards_curve_params: CurveParams::default(),
             upwards_curve_params: CurveParams::default(),
-            downwards_eq_params: EqCurveParams::default(),
-            upwards_eq_params: EqCurveParams::default(),
+            eq_params: EqCurveParams::default(),
             curve_offsets_db: (0.0, 0.0),
             num_bins: 0,
             envelope_followers: [0.0; crate::MAX_WINDOW_SIZE / 2 + 1],

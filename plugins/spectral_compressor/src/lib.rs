@@ -320,7 +320,8 @@ impl Plugin for SpectralCompressor {
                 analyzer_data: self.analyzer_output_data.clone(),
                 sample_rate: self.sample_rate.clone(),
 
-                edited_direction: editor::EditedDirection::Downwards,
+                edited_direction: eq_curve::CompressorDirection::Downwards,
+                node_menu: editor::NodeMenu::default(),
             },
         )
     }

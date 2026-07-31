@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use crate::analyzer::AnalyzerData;
 use crate::curve::{Curve, CurveParams};
-use crate::eq_curve::{power_to_db, EqBankParams, EqCurve, EqCurveParams};
+use crate::eq_curve::{power_to_db, CompressorDirection, EqBankParams, EqCurve, EqCurveParams};
 use crate::SpectralCompressorParams;
 
 // These are the parameter name prefixes used for the downwards and upwards compression parameters.
@@ -137,11 +137,6 @@ pub struct ThresholdParams {
     /// visibly show the same number instead of one silently shadowing the other.
     #[id = "thresh_link"]
     pub slope_curve_link: BoolParam,
-    /// The same, but for the two compressors' banks of EQ nodes. This is kept separate from
-    /// [`Self::slope_curve_link`] so the curve's broad tilt and its fine detail can be linked
-    /// independently of each other.
-    #[id = "eq_link"]
-    pub eq_link: BoolParam,
 
     /// Controls the type of threshold that should be used. Check [`ThresholdMode`] for more
     /// information.
@@ -152,6 +147,11 @@ pub struct ThresholdParams {
     /// to the the compression parameters when using the sidechain modes.
     #[id = "thresh_sc_link"]
     pub sc_channel_link: FloatParam,
+
+    /// EQ-shaped nodes deforming the threshold curves on top of the polynomial above. One bank is
+    /// shared by both compressors, with each node choosing which of them it applies to.
+    #[nested(group = "Threshold EQ")]
+    pub eq: EqBankParams,
 }
 
 /// The type of threshold to use.
@@ -226,12 +226,6 @@ pub struct CompressorParams {
     /// The compression knee width, in decibels.
     #[id = "knee"]
     pub knee_width_db: FloatParam,
-
-    /// EQ-shaped nodes that deform this compressor's threshold curve on top of the polynomial
-    /// above. The `id_prefix` on this struct a level up carries through to the nodes, so their
-    /// IDs end up looking like `upwards_eqfreq_1`.
-    #[nested(group = "Threshold EQ")]
-    pub eq: EqBankParams,
 }
 
 impl ThresholdParams {
@@ -254,6 +248,8 @@ impl ThresholdParams {
             should_update_upwards_knee_parabolas.store(true, Ordering::SeqCst);
         });
 
+        let set_update_both_thresholds_for_eq = set_update_both_thresholds.clone();
+
         ThresholdParams {
             threshold_db: FloatParam::new(
                 "Global Threshold",
@@ -271,7 +267,6 @@ impl ThresholdParams {
             // above the two compressor columns instead of in the threshold column, so it's hidden
             // from the generic UI to avoid showing up twice.
             slope_curve_link: BoolParam::new("Thresh Curve Link", true).hide_in_generic_ui(),
-            eq_link: BoolParam::new("Thresh EQ Link", true).hide_in_generic_ui(),
 
             mode: EnumParam::new("Mode", ThresholdMode::Internal)
                 // Not the most efficient way to do this, but it's a bit cleaner than the
@@ -285,6 +280,8 @@ impl ThresholdParams {
             .with_unit("%")
             .with_value_to_string(formatters::v2s_f32_percentage(0))
             .with_string_to_value(formatters::s2v_f32_percentage()),
+
+            eq: EqBankParams::new("", set_update_both_thresholds_for_eq),
         }
     }
 
@@ -457,8 +454,6 @@ impl CompressorParams {
             .with_callback(set_update_knee_parabolas)
             .with_unit(" dB")
             .with_step_size(0.1),
-
-            eq: EqBankParams::new(name_prefix, set_update_thresholds),
         }
     }
 }
@@ -690,8 +685,7 @@ impl CompressorBank {
                 params.threshold.curve_params(&params.compressors.downwards);
             analyzer_input_data.upwards_curve_params =
                 params.threshold.curve_params(&params.compressors.upwards);
-            analyzer_input_data.downwards_eq_params = params.compressors.downwards.eq.snapshot();
-            analyzer_input_data.upwards_eq_params = params.compressors.upwards.eq.snapshot();
+            analyzer_input_data.eq_params = params.threshold.eq.snapshot();
             analyzer_input_data.curve_offsets_db = (
                 params.compressors.upwards.threshold_offset_db.value(),
                 params.compressors.downwards.threshold_offset_db.value(),
@@ -1117,10 +1111,11 @@ impl CompressorBank {
         thresholds_db: &mut [f32],
         curve_params: &CurveParams,
         eq_params: &EqCurveParams,
+        direction: CompressorDirection,
         intercept_db: f32,
     ) {
         let curve = Curve::new(curve_params);
-        let eq_curve = EqCurve::new(eq_params);
+        let eq_curve = EqCurve::new(eq_params, direction);
 
         // Skipping the scratch buffer entirely when every node is off keeps the common case as
         // cheap as it was before the nodes existed
@@ -1161,7 +1156,8 @@ impl CompressorBank {
                 &mut self.eq_power,
                 &mut self.downwards_thresholds_db,
                 &params.threshold.curve_params(&params.compressors.downwards),
-                &params.compressors.downwards.eq.snapshot(),
+                &params.threshold.eq.snapshot(),
+                CompressorDirection::Downwards,
                 params.compressors.downwards.threshold_offset_db.value(),
             );
         }
@@ -1177,7 +1173,8 @@ impl CompressorBank {
                 &mut self.eq_power,
                 &mut self.upwards_thresholds_db,
                 &params.threshold.curve_params(&params.compressors.upwards),
-                &params.compressors.upwards.eq.snapshot(),
+                &params.threshold.eq.snapshot(),
+                CompressorDirection::Upwards,
                 params.compressors.upwards.threshold_offset_db.value(),
             );
         }

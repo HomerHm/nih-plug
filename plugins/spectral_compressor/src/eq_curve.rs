@@ -27,11 +27,60 @@
 use nih_plug::prelude::*;
 use std::sync::Arc;
 
-/// The number of nodes available per compressor.
+/// The number of nodes available.
+///
+/// A single bank is shared by both compressors, with each node choosing which of them it applies
+/// to, so this is the total rather than a per-compressor count.
 ///
 /// Raising this later is safe. **Lowering it is not**: presets that used the higher-numbered nodes
 /// would silently lose them.
-pub const MAX_EQ_NODES: usize = 6;
+pub const MAX_EQ_NODES: usize = 8;
+
+/// Which of the two compressors something applies to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressorDirection {
+    Upwards,
+    Downwards,
+}
+
+impl CompressorDirection {
+    pub fn name(self) -> &'static str {
+        match self {
+            CompressorDirection::Upwards => "Upwards",
+            CompressorDirection::Downwards => "Downwards",
+        }
+    }
+}
+
+/// Which compressor's threshold curve a node deforms.
+///
+/// This replaces what used to be a single switch linking two separate banks. That switch had to
+/// overwrite one bank with the other to take effect, which threw away whichever curve happened to
+/// be on the losing side. Choosing per node means nothing is ever discarded.
+#[derive(Enum, Debug, PartialEq, Eq, Clone, Copy, Default)]
+pub enum EqNodeTarget {
+    #[default]
+    #[id = "both"]
+    #[name = "Both"]
+    Both,
+    #[id = "downwards"]
+    #[name = "Downwards"]
+    Downwards,
+    #[id = "upwards"]
+    #[name = "Upwards"]
+    Upwards,
+}
+
+impl EqNodeTarget {
+    /// Whether a node with this target contributes to `direction`'s threshold curve.
+    pub fn applies_to(self, direction: CompressorDirection) -> bool {
+        match self {
+            EqNodeTarget::Both => true,
+            EqNodeTarget::Downwards => direction == CompressorDirection::Downwards,
+            EqNodeTarget::Upwards => direction == CompressorDirection::Upwards,
+        }
+    }
+}
 
 /// Power ratios below this are clamped before being converted to decibels. A notch reaches exactly
 /// zero, which would otherwise produce `-inf`.
@@ -44,7 +93,8 @@ const MIN_POWER: f32 = 1e-30;
 
 /// Default center frequencies, spread over the spectrum so enabling several nodes doesn't stack
 /// them all on the same frequency.
-const DEFAULT_FREQUENCIES: [f32; MAX_EQ_NODES] = [100.0, 250.0, 630.0, 1600.0, 4000.0, 10_000.0];
+const DEFAULT_FREQUENCIES: [f32; MAX_EQ_NODES] =
+    [60.0, 120.0, 250.0, 500.0, 1000.0, 2500.0, 6000.0, 12_000.0];
 
 /// The shape of a single threshold curve node.
 ///
@@ -109,6 +159,7 @@ impl EqNodeType {
 #[derive(Debug, Clone, Copy)]
 pub struct EqNode {
     pub node_type: EqNodeType,
+    pub target: EqNodeTarget,
     pub center_frequency: f32,
     pub gain_db: f32,
     pub q: f32,
@@ -118,6 +169,7 @@ impl Default for EqNode {
     fn default() -> Self {
         EqNode {
             node_type: EqNodeType::Off,
+            target: EqNodeTarget::Both,
             center_frequency: 1000.0,
             gain_db: 0.0,
             q: 1.0,
@@ -304,12 +356,15 @@ pub struct EqCurve {
 }
 
 impl EqCurve {
-    /// Precompute the constants for every active node in `params`. Allocation free, so this is
-    /// safe to call from the audio thread.
-    pub fn new(params: &EqCurveParams) -> Self {
+    /// Precompute the constants for every active node in `params` that applies to `direction`.
+    /// Allocation free, so this is safe to call from the audio thread.
+    pub fn new(params: &EqCurveParams, direction: CompressorDirection) -> Self {
         let mut nodes = [None; MAX_EQ_NODES];
         let mut len = 0;
         for node in &params.nodes {
+            if !node.target.applies_to(direction) {
+                continue;
+            }
             if let Some(prepared) = PreparedNode::new(node) {
                 nodes[len] = Some(prepared);
                 len += 1;
@@ -362,6 +417,9 @@ pub fn power_to_db(power: f32) -> f32 {
 pub struct EqNodeParams {
     #[id = "eqtype"]
     pub node_type: EnumParam<EqNodeType>,
+    /// Which compressor's curve this node deforms.
+    #[id = "eqtarget"]
+    pub target: EnumParam<EqNodeTarget>,
     #[id = "eqfreq"]
     pub center_frequency: FloatParam,
     #[id = "eqgain"]
@@ -382,7 +440,7 @@ impl EqNodeParams {
 
         EqNodeParams {
             node_type: EnumParam::new(
-                format!("{name_prefix} Node {node_number} Type"),
+                format!("{name_prefix}Node {node_number} Type"),
                 EqNodeType::Off,
             )
             .with_callback({
@@ -390,8 +448,17 @@ impl EqNodeParams {
                 Arc::new(move |_| set_update_thresholds(0.0))
             })
             .hide_in_generic_ui(),
+            target: EnumParam::new(
+                format!("{name_prefix}Node {node_number} Target"),
+                EqNodeTarget::Both,
+            )
+            .with_callback({
+                let set_update_thresholds = set_update_thresholds.clone();
+                Arc::new(move |_| set_update_thresholds(0.0))
+            })
+            .hide_in_generic_ui(),
             center_frequency: FloatParam::new(
-                format!("{name_prefix} Node {node_number} Freq"),
+                format!("{name_prefix}Node {node_number} Freq"),
                 DEFAULT_FREQUENCIES[index],
                 FloatRange::Skewed {
                     min: 20.0,
@@ -405,7 +472,7 @@ impl EqNodeParams {
             .with_string_to_value(formatters::s2v_f32_hz_then_khz())
             .hide_in_generic_ui(),
             gain_db: FloatParam::new(
-                format!("{name_prefix} Node {node_number} Gain"),
+                format!("{name_prefix}Node {node_number} Gain"),
                 0.0,
                 FloatRange::Linear {
                     min: -30.0,
@@ -417,7 +484,7 @@ impl EqNodeParams {
             .with_step_size(0.1)
             .hide_in_generic_ui(),
             q: FloatParam::new(
-                format!("{name_prefix} Node {node_number} Q"),
+                format!("{name_prefix}Node {node_number} Q"),
                 1.0,
                 FloatRange::Skewed {
                     min: 0.1,
@@ -435,6 +502,7 @@ impl EqNodeParams {
     pub fn snapshot(&self) -> EqNode {
         EqNode {
             node_type: self.node_type.value(),
+            target: self.target.value(),
             center_frequency: self.center_frequency.value(),
             gain_db: self.gain_db.value(),
             q: self.q.value(),
@@ -473,16 +541,27 @@ impl EqBankParams {
 mod tests {
     use super::*;
 
-    /// Decibels at `frequency` for a single node.
+    /// Decibels at `frequency` for a single node, as seen by the downwards compressor.
     fn node_db(node: EqNode, frequency: f32) -> f32 {
         let mut params = EqCurveParams::default();
         params.nodes[0] = node;
-        EqCurve::new(&params).evaluate_db(frequency)
+        EqCurve::new(&params, CompressorDirection::Downwards).evaluate_db(frequency)
+    }
+
+    /// A node of `node_type` at 1 kHz with the given gain.
+    fn bell(gain_db: f32) -> EqNode {
+        EqNode {
+            node_type: EqNodeType::Bell,
+            target: EqNodeTarget::Both,
+            center_frequency: 1000.0,
+            gain_db,
+            q: 1.0,
+        }
     }
 
     #[test]
     fn off_nodes_contribute_nothing() {
-        let curve = EqCurve::new(&EqCurveParams::default());
+        let curve = EqCurve::new(&EqCurveParams::default(), CompressorDirection::Downwards);
         assert!(curve.is_empty());
         assert_eq!(curve.evaluate_db(1000.0), 0.0);
     }
@@ -493,6 +572,7 @@ mod tests {
             let db = node_db(
                 EqNode {
                     node_type: EqNodeType::Bell,
+                    target: EqNodeTarget::Both,
                     center_frequency: 1000.0,
                     gain_db,
                     q: 1.0,
@@ -510,6 +590,7 @@ mod tests {
     fn bell_decays_to_unity_away_from_its_center() {
         let node = EqNode {
             node_type: EqNodeType::Bell,
+            target: EqNodeTarget::Both,
             center_frequency: 1000.0,
             gain_db: 12.0,
             q: 4.0,
@@ -522,6 +603,7 @@ mod tests {
     fn shelves_reach_their_gain_on_the_correct_side() {
         let low = EqNode {
             node_type: EqNodeType::LowShelf,
+            target: EqNodeTarget::Both,
             center_frequency: 1000.0,
             gain_db: 12.0,
             q: 0.7,
@@ -550,6 +632,7 @@ mod tests {
             let db = node_db(
                 EqNode {
                     node_type,
+                    target: EqNodeTarget::Both,
                     center_frequency: 1000.0,
                     gain_db: 0.0,
                     q: 1.0,
@@ -573,6 +656,7 @@ mod tests {
         ] {
             let node = EqNode {
                 node_type,
+                target: EqNodeTarget::Both,
                 center_frequency: 1000.0,
                 gain_db: 0.0,
                 q: 1.0,
@@ -591,6 +675,7 @@ mod tests {
     fn notch_nulls_at_its_center_and_recovers_beside_it() {
         let node = EqNode {
             node_type: EqNodeType::Notch,
+            target: EqNodeTarget::Both,
             center_frequency: 1000.0,
             gain_db: 0.0,
             q: 4.0,
@@ -605,19 +690,71 @@ mod tests {
         let mut params = EqCurveParams::default();
         params.nodes[0] = EqNode {
             node_type: EqNodeType::Bell,
+            target: EqNodeTarget::Both,
             center_frequency: 1000.0,
             gain_db: 6.0,
             q: 1.0,
         };
         params.nodes[1] = EqNode {
             node_type: EqNodeType::Bell,
+            target: EqNodeTarget::Both,
             center_frequency: 1000.0,
             gain_db: 4.0,
             q: 1.0,
         };
 
-        let db = EqCurve::new(&params).evaluate_db(1000.0);
+        let db = EqCurve::new(&params, CompressorDirection::Downwards).evaluate_db(1000.0);
         assert!((db - 10.0).abs() < 0.01, "two stacked bells gave {db} dB");
+    }
+
+    #[test]
+    fn a_node_only_reaches_the_compressors_it_targets() {
+        for (target, expected_downwards, expected_upwards) in [
+            (EqNodeTarget::Both, 6.0, 6.0),
+            (EqNodeTarget::Downwards, 6.0, 0.0),
+            (EqNodeTarget::Upwards, 0.0, 6.0),
+        ] {
+            let mut params = EqCurveParams::default();
+            params.nodes[0] = EqNode {
+                target,
+                ..bell(6.0)
+            };
+
+            let downwards =
+                EqCurve::new(&params, CompressorDirection::Downwards).evaluate_db(1000.0);
+            let upwards = EqCurve::new(&params, CompressorDirection::Upwards).evaluate_db(1000.0);
+            assert!(
+                (downwards - expected_downwards).abs() < 0.01,
+                "{target:?} gave the downwards curve {downwards} dB"
+            );
+            assert!(
+                (upwards - expected_upwards).abs() < 0.01,
+                "{target:?} gave the upwards curve {upwards} dB"
+            );
+        }
+    }
+
+    #[test]
+    fn differently_targeted_nodes_do_not_bleed_into_each_other() {
+        // What the old single link switch could not express: each curve shaped independently,
+        // with nothing overwritten to achieve it
+        let mut params = EqCurveParams::default();
+        params.nodes[0] = EqNode {
+            target: EqNodeTarget::Downwards,
+            ..bell(6.0)
+        };
+        params.nodes[1] = EqNode {
+            target: EqNodeTarget::Upwards,
+            ..bell(-9.0)
+        };
+
+        let downwards = EqCurve::new(&params, CompressorDirection::Downwards).evaluate_db(1000.0);
+        let upwards = EqCurve::new(&params, CompressorDirection::Upwards).evaluate_db(1000.0);
+        assert!(
+            (downwards - 6.0).abs() < 0.01,
+            "downwards gave {downwards} dB"
+        );
+        assert!((upwards - -9.0).abs() < 0.01, "upwards gave {upwards} dB");
     }
 
     #[test]
@@ -625,23 +762,26 @@ mod tests {
         let mut params = EqCurveParams::default();
         params.nodes[0] = EqNode {
             node_type: EqNodeType::Bell,
+            target: EqNodeTarget::Both,
             center_frequency: 800.0,
             gain_db: -9.0,
             q: 2.5,
         };
         params.nodes[1] = EqNode {
             node_type: EqNodeType::HighShelf,
+            target: EqNodeTarget::Both,
             center_frequency: 5000.0,
             gain_db: 6.0,
             q: 0.7,
         };
         params.nodes[2] = EqNode {
             node_type: EqNodeType::LowCut24,
+            target: EqNodeTarget::Both,
             center_frequency: 60.0,
             gain_db: 0.0,
             q: 1.0,
         };
-        let curve = EqCurve::new(&params);
+        let curve = EqCurve::new(&params, CompressorDirection::Downwards);
 
         let frequencies = [30.0, 120.0, 800.0, 3000.0, 12_000.0];
         let mut power = [1.0; 5];
