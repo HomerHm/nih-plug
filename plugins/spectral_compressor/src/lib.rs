@@ -282,7 +282,9 @@ impl SpectralCompressorParams {
 }
 
 impl Plugin for SpectralCompressor {
-    const NAME: &'static str = "Spectral Compressor";
+    const NAME: &'static str = "Spectral Compressor HM";
+    // The original author and project are deliberately kept here. This fork's own attribution
+    // lives in the GUI as a "Mod by HomerHm" link, see `editor.rs`.
     const VENDOR: &'static str = "Robbert van der Helm";
     const URL: &'static str = env!("CARGO_PKG_HOMEPAGE");
     const EMAIL: &'static str = "mail@robbertvanderhelm.nl";
@@ -620,8 +622,9 @@ fn process_stft_sidechain(
 }
 
 impl ClapPlugin for SpectralCompressor {
-    const CLAP_ID: &'static str = "nl.robbertvanderhelm.spectral-compressor";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some("Turn things into pink noise on demand");
+    const CLAP_ID: &'static str = "com.homerhm.spectral-compressor-hm";
+    const CLAP_DESCRIPTION: Option<&'static str> =
+        Some("Turn things into pink noise on demand (HomerHm fork)");
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[
@@ -636,7 +639,9 @@ impl ClapPlugin for SpectralCompressor {
 }
 
 impl Vst3Plugin for SpectralCompressor {
-    const VST3_CLASS_ID: [u8; 16] = *b"SpectrlComprRvdH";
+    // NOTE: This must be exactly 16 bytes, and it must differ from the upstream
+    //       `SpectrlComprRvdH` so this fork and the original can coexist in a host.
+    const VST3_CLASS_ID: [u8; 16] = *b"SpectralComprsHM";
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
         Vst3SubCategory::Fx,
         Vst3SubCategory::Dynamics,

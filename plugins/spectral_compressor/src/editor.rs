@@ -43,6 +43,23 @@ const COLUMN_WIDTH: Units = Pixels(330.0);
 
 const DARKER_GRAY: Color = Color::rgb(0x69, 0x69, 0x69);
 
+/// Where the "Mod by HomerHm" label links to. The plugin title itself still links to
+/// [`SpectralCompressor::URL`], which points at the original upstream project.
+const MOD_URL: &str = "https://github.com/HomerHm/nih-plug";
+
+/// Open `url` in the user's browser, ignoring failures. Mirrors what the title label does.
+fn open_url(url: &str) {
+    // FIXME: On Windows this blocks, and while this is blocking a timer may proc which causes
+    //        the window state to be mutably borrowed again, resulting in a panic. This needs to
+    //        be fixed in baseview first.
+    if cfg!(not(windows)) {
+        let result = open::that(url);
+        if cfg!(debug_assertions) && result.is_err() {
+            nih_debug_assert_failure!("Failed to open web browser: {:?}", result);
+        }
+    }
+}
+
 /// The editor's mode. Essentially just a boolean to indicate whether the analyzer is shown or
 /// not.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,27 +135,22 @@ fn main_column(cx: &mut Context) {
                     .font_family(vec![FamilyOwned::Name(String::from(assets::NOTO_SANS))])
                     .font_weight(FontWeightKeyword::Thin)
                     .font_size(30.0)
-                    .on_mouse_down(|_, _| {
-                        // FIXME: On Windows this blocks, and while this is blocking a timer may
-                        //        proc which causes the window state to be mutably borrowed again,
-                        //        resulting in a panic. This needs to be fixed in baseview first.
-                        if cfg!(not(windows)) {
-                            // Try to open the plugin's page when clicking on the title. If this
-                            // fails then that's not a problem
-                            let result = open::that(SpectralCompressor::URL);
-                            if cfg!(debug_assertions) && result.is_err() {
-                                nih_debug_assert_failure!(
-                                    "Failed to open web browser: {:?}",
-                                    result
-                                );
-                            }
-                        }
-                    });
+                    // Clicking the title opens the original project's page
+                    .on_mouse_down(|_, _| open_url(SpectralCompressor::URL));
                 Label::new(cx, SpectralCompressor::VERSION)
                     .color(DARKER_GRAY)
                     .top(Stretch(1.0))
                     .bottom(Pixels(4.0))
                     .left(Pixels(2.0));
+                // GPL requires modified versions to be marked as such. This also doubles as the
+                // link to this fork, so the title above can keep pointing at the original.
+                Label::new(cx, "Mod by HomerHm")
+                    .color(DARKER_GRAY)
+                    .font_size(11.0)
+                    .top(Stretch(1.0))
+                    .bottom(Pixels(5.0))
+                    .left(Pixels(8.0))
+                    .on_mouse_down(|_, _| open_url(MOD_URL));
             })
             .size(Auto);
         })
