@@ -27,9 +27,12 @@ use crate::curve::CurveParams;
 /// current window size is 2048, then only the first `2048 / 2 + 1` elements in the arrays are used.
 #[derive(Debug, Clone)]
 pub struct AnalyzerData {
-    /// The parameters used for the global threshold curve. This is used to draw the same curve used
-    /// by the compressors on the analyzer.
-    pub curve_params: CurveParams,
+    /// The parameters used for the downwards compressors' threshold curve. This is used to draw the
+    /// same curve used by the compressors on the analyzer.
+    pub downwards_curve_params: CurveParams,
+    /// The same, but for the upwards compressors. Equal to `downwards_curve_params` while the two
+    /// curves are linked, in which case the two drawn curves only differ by their offsets.
+    pub upwards_curve_params: CurveParams,
     /// The upwards and downwards threshold offsets for the curve. These are used to draw the curve
     /// twice with some distance between them if either is non-zero.
     pub curve_offsets_db: (f32, f32),
@@ -55,7 +58,8 @@ pub struct AnalyzerData {
 impl Default for AnalyzerData {
     fn default() -> Self {
         Self {
-            curve_params: CurveParams::default(),
+            downwards_curve_params: CurveParams::default(),
+            upwards_curve_params: CurveParams::default(),
             curve_offsets_db: (0.0, 0.0),
             num_bins: 0,
             envelope_followers: [0.0; crate::MAX_WINDOW_SIZE / 2 + 1],

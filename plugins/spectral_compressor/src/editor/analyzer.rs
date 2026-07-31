@@ -22,7 +22,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
 use crate::analyzer::AnalyzerData;
-use crate::curve::Curve;
+use crate::curve::{Curve, CurveParams};
 
 // We'll show the bins from 30 Hz (to your chest) to 22 kHz, scaled logarithmically
 #[allow(unused)]
@@ -256,8 +256,8 @@ fn draw_spectrum(
     canvas.fill_path(&mesh_path, &mesh_paint);
 }
 
-/// Overlays the threshold curve over the spectrum analyzer. If either the upwards or downwards
-/// threshold offsets are non-zero then two curves are drawn.
+/// Overlays the threshold curves over the spectrum analyzer. The upwards and downwards curves can
+/// have different shapes as well as different offsets, so both are always drawn.
 fn draw_threshold_curve(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data: &AnalyzerData) {
     let bounds = cx.bounds();
 
@@ -269,10 +269,11 @@ fn draw_threshold_curve(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data
     // This can be done slightly cleverer but for our purposes drawing line segments that are either
     // 1 pixel apart or that split the curve up into 100 segments (whichever results in the least
     // amount of line segments) should be sufficient
-    let curve = Curve::new(&analyzer_data.curve_params);
     let num_points = 100.min(bounds.w.ceil() as usize);
 
-    let mut draw_with_offset = |offset_db: f32, paint: vg::Paint| {
+    let mut draw_curve = |curve_params: &CurveParams, offset_db: f32, paint: vg::Paint| {
+        let curve = Curve::new(curve_params);
+
         let mut path = vg::Path::new();
         for i in 0..num_points {
             let x_t = i as f32 / (num_points - 1) as f32;
@@ -302,8 +303,16 @@ fn draw_threshold_curve(cx: &mut DrawContext, canvas: &mut Canvas, analyzer_data
     };
 
     let (upwards_offset_db, downwards_offset_db) = analyzer_data.curve_offsets_db;
-    draw_with_offset(upwards_offset_db, upwards_paint);
-    draw_with_offset(downwards_offset_db, downwards_paint);
+    draw_curve(
+        &analyzer_data.upwards_curve_params,
+        upwards_offset_db,
+        upwards_paint,
+    );
+    draw_curve(
+        &analyzer_data.downwards_curve_params,
+        downwards_offset_db,
+        downwards_paint,
+    );
 }
 
 /// Overlays the gain reduction display over the spectrum analyzer.
