@@ -453,7 +453,8 @@ fn labelled_row(cx: &mut Context, label: &'static str, widget: impl FnOnce(&mut 
         Label::new(cx, label).class("label");
         widget(cx);
     })
-    .class("row");
+    // Not `row`: that is only styled inside a generic UI, and this is not in one
+    .class("param-row");
 }
 
 /// A lens to one compressor's parameters, picked by the same name used for its heading.

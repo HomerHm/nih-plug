@@ -18,3 +18,19 @@ analyzer {
   background-color: #b4b4b4;
   color: #161616;
 }
+
+/* Rows built by hand rather than by a GenericUi.
+   nih_plug_vizia styles its rows as `generic-ui .row`, so anything outside a generic UI gets none
+   of it. Without `height: auto` these inherit vizia's stretch default, the column around them
+   computes to no height at all, and every row lands on top of the next. */
+.param-row {
+  col-between: 6px;
+  height: auto;
+  layout-type: row;
+}
+
+.param-row .label {
+  left: 1s;
+  top: 1s;
+  bottom: 1s;
+}
