@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use self::analyzer::{format_frequency, frequency_to_t, Analyzer, FREQUENCY_TICKS};
 use self::param_link::{param_ptr_by_id, ParamLink};
 use crate::analyzer::AnalyzerData;
-use crate::eq_curve::{CompressorDirection, EqNodeParams, EqNodeTarget, EqNodeType, MAX_EQ_NODES};
+use crate::eq_curve::{CompressorDirection, EqNodeParams, EqNodeType};
 use crate::{SpectralCompressor, SpectralCompressorParams};
 
 mod analyzer;
@@ -82,39 +82,8 @@ impl nih_plug_vizia::vizia::prelude::Data for CompressorDirection {
 pub enum EditorEvent {
     /// Switch which curve the analyzer edits.
     SelectDirection(CompressorDirection),
-    /// Open the context menu for a node at the given position within the window.
-    OpenNodeMenu { node_index: usize, x: f32, y: f32 },
-    /// Dismiss the context menu.
-    CloseNodeMenu,
-}
-
-/// The state of the node context menu.
-///
-/// The popup has to exist in the view tree up front rather than being conjured in an event
-/// handler, so it's built once and bound to this.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct NodeMenu {
-    pub open: bool,
-    pub node_index: usize,
-    pub x: f32,
-    pub y: f32,
-}
-
-impl Default for NodeMenu {
-    fn default() -> Self {
-        NodeMenu {
-            open: false,
-            node_index: 0,
-            x: 0.0,
-            y: 0.0,
-        }
-    }
-}
-
-impl nih_plug_vizia::vizia::prelude::Data for NodeMenu {
-    fn same(&self, other: &Self) -> bool {
-        self == other
-    }
+    /// Select a node for the inspector below the analyzer, or clear the selection.
+    SelectNode(Option<usize>),
 }
 
 #[derive(Clone, Lens)]
@@ -128,23 +97,15 @@ pub struct Data {
     /// Which curve the analyzer edits. Editor state rather than a parameter, since it changes
     /// nothing about the sound.
     pub(crate) edited_direction: CompressorDirection,
-    /// The node context menu's state.
-    pub(crate) node_menu: NodeMenu,
+    /// The node the inspector below the analyzer is editing, if any.
+    pub(crate) selected_node: Option<usize>,
 }
 
 impl Model for Data {
     fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
         event.map(|editor_event, _| match editor_event {
             EditorEvent::SelectDirection(direction) => self.edited_direction = *direction,
-            EditorEvent::OpenNodeMenu { node_index, x, y } => {
-                self.node_menu = NodeMenu {
-                    open: true,
-                    node_index: *node_index,
-                    x: *x,
-                    y: *y,
-                };
-            }
-            EditorEvent::CloseNodeMenu => self.node_menu.open = false,
+            EditorEvent::SelectNode(node_index) => self.selected_node = *node_index,
         });
     }
 }
@@ -179,8 +140,6 @@ pub(crate) fn create(editor_state: Arc<ViziaState>, editor_data: Data) -> Option
             })
             .row_between(Pixels(10.0));
         });
-
-        node_menu(cx);
 
         ResizeHandle::new(cx);
     })
@@ -254,11 +213,13 @@ fn analyzer(cx: &mut Context) {
             Data::sample_rate,
             Data::params,
             Data::edited_direction,
+            Data::selected_node,
         )
         // Soaks up all vertical space the controls below don't need
         .height(Stretch(1.0));
 
         frequency_scale(cx);
+        node_inspector(cx);
     })
     .height(Stretch(1.0))
     .left(Pixels(12.0))
@@ -418,78 +379,83 @@ fn compressor_params_lens(
     })
 }
 
-/// The context menu shown when right clicking a node.
+/// The controls for the selected node, shown underneath the analyzer.
 ///
-/// Everything here is something that can't sensibly be expressed as a drag: picking the node's
-/// shape, choosing which curve it deforms, and removing it.
-fn node_menu(cx: &mut Context) {
-    MenuPopup::new(cx, Data::node_menu.map(|menu| menu.open), true, |cx| {
-        enum_submenu(cx, "Type", EqNodeType::variants(), |node| {
-            node.node_type.as_ptr()
-        });
-        enum_submenu(cx, "Applies to", EqNodeTarget::variants(), |node| {
-            node.target.as_ptr()
-        });
-
-        MenuDivider::new(cx);
-
-        let off_index = EqNodeType::variants()
-            .iter()
-            .position(|name| *name == "Off")
-            .expect("EqNodeType has no Off variant, this is a bug");
-        MenuButton::new(
-            cx,
-            move |cx| {
-                // Switching a node off is what removing it means. Its other parameters stay put,
-                // so the host's automation lanes don't shift around underneath the user.
-                set_node_variant(
+/// Everything here is something a drag can't express: the node's shape, which compressors it
+/// applies to, and removing it. It's a fixed row rather than a context menu because vizia's popups
+/// need a good deal of the default stylesheet that `ViziaTheming::Custom` doesn't load, and this
+/// costs far less to get working. It also puts typed entry within reach, since every slider here
+/// already takes a keyboard value on a double click.
+fn node_inspector(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        Binding::new(cx, Data::selected_node, |cx, selected| {
+            let Some(index) = selected.get(cx) else {
+                Label::new(
                     cx,
-                    |node| node.node_type.as_ptr(),
-                    off_index,
-                    EqNodeType::variants().len(),
-                );
-                cx.emit(EditorEvent::CloseNodeMenu);
-            },
-            |cx| Label::new(cx, "Delete"),
-        );
+                    "Double click the graph to add a node, or click one to edit it",
+                )
+                .color(DARKER_GRAY)
+                .font_size(12.0)
+                .top(Stretch(1.0))
+                .bottom(Stretch(1.0));
+                return;
+            };
+
+            Label::new(cx, &format!("Node {}", index + 1))
+                .width(Pixels(60.0))
+                .top(Stretch(1.0))
+                .bottom(Stretch(1.0));
+
+            let params = Data::params;
+            ParamSlider::new(cx, params, move |p| &p.threshold.eq.nodes[index].node_type)
+                .set_style(ParamSliderStyle::FromLeft)
+                .width(Pixels(150.0));
+            ParamSlider::new(cx, params, move |p| &p.threshold.eq.nodes[index].target)
+                .set_style(ParamSliderStyle::FromLeft)
+                .width(Pixels(120.0));
+            ParamSlider::new(cx, params, move |p| {
+                &p.threshold.eq.nodes[index].center_frequency
+            })
+            .width(Pixels(110.0));
+            ParamSlider::new(cx, params, move |p| &p.threshold.eq.nodes[index].gain_db)
+                .width(Pixels(110.0));
+            ParamSlider::new(cx, params, move |p| &p.threshold.eq.nodes[index].q)
+                .width(Pixels(90.0));
+
+            Button::new(
+                cx,
+                move |cx| {
+                    // Switching a node off is what removing it means. Its other parameters stay
+                    // put, so the host's automation lanes don't shift around underneath the user.
+                    let off_index = EqNodeType::variants()
+                        .iter()
+                        .position(|name| *name == "Off")
+                        .expect("EqNodeType has no Off variant, this is a bug");
+                    set_node_variant(
+                        cx,
+                        index,
+                        |node| node.node_type.as_ptr(),
+                        off_index,
+                        EqNodeType::variants().len(),
+                    );
+                    cx.emit(EditorEvent::SelectNode(None));
+                },
+                |cx| Label::new(cx, "Delete"),
+            )
+            .class("direction-button");
+        });
     })
-    .position_type(PositionType::SelfDirected)
-    .left(Data::node_menu.map(|menu| Pixels(menu.x)))
-    .top(Data::node_menu.map(|menu| Pixels(menu.y)))
-    .on_blur(|cx| cx.emit(EditorEvent::CloseNodeMenu));
+    .height(Pixels(24.0))
+    .col_between(Pixels(4.0))
+    .child_left(Stretch(1.0))
+    .child_right(Stretch(1.0))
+    .top(Pixels(4.0));
 }
 
-/// A submenu listing every variant of one of a node's enum parameters.
-///
-/// The entries are generated from the parameter's own variant list, so adding a node shape later
-/// shows up here without this needing to be touched.
-fn enum_submenu(
-    cx: &mut Context,
-    title: &'static str,
-    variants: &'static [&'static str],
-    param_ptr: fn(&EqNodeParams) -> ParamPtr,
-) {
-    Submenu::new(
-        cx,
-        move |cx| Label::new(cx, title),
-        move |cx| {
-            for (index, name) in variants.iter().enumerate() {
-                MenuButton::new(
-                    cx,
-                    move |cx| {
-                        set_node_variant(cx, param_ptr, index, variants.len());
-                        cx.emit(EditorEvent::CloseNodeMenu);
-                    },
-                    move |cx| Label::new(cx, *name),
-                );
-            }
-        },
-    );
-}
-
-/// Set one of the context menu's node's enum parameters to the variant at `index`.
+/// Set one of a node's enum parameters to the variant at `index`.
 fn set_node_variant(
     cx: &mut EventContext,
+    node_index: usize,
     param_ptr: fn(&EqNodeParams) -> ParamPtr,
     index: usize,
     variant_count: usize,
@@ -497,7 +463,7 @@ fn set_node_variant(
     let Some(data) = cx.data::<Data>() else {
         return;
     };
-    let ptr = param_ptr(&data.params.threshold.eq.nodes[data.node_menu.node_index]);
+    let ptr = param_ptr(&data.params.threshold.eq.nodes[node_index]);
 
     // An enum parameter's normalized range is divided evenly between its variants
     let normalized = index as f32 / (variant_count.saturating_sub(1).max(1)) as f32;

@@ -111,7 +111,7 @@ const UPWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.55, 0.70, 0.
 
 /// A very analyzer showing the envelope followers as a magnitude spectrum with an overlay for the
 /// gain reduction.
-pub struct Analyzer<L> {
+pub struct Analyzer<L, LSelected> {
     analyzer_data: Arc<Mutex<triple_buffer::Output<AnalyzerData>>>,
     sample_rate: Arc<AtomicF32>,
     /// Which compressor's curve the mouse acts on. Read during both drawing and event handling,
@@ -121,6 +121,8 @@ pub struct Analyzer<L> {
     params: Arc<SpectralCompressorParams>,
     /// Set for the duration of a drag.
     drag: Option<NodeDrag>,
+    /// Which node the inspector below the graph is editing, so its handle can be marked.
+    selected_node: LSelected,
 }
 
 /// A node handle being dragged.
@@ -136,9 +138,10 @@ struct NodeDrag {
     start_cursor: (f32, f32),
 }
 
-impl<L> Analyzer<L>
+impl<L, LSelected> Analyzer<L, LSelected>
 where
     L: Lens<Target = CompressorDirection>,
+    LSelected: Lens<Target = Option<usize>>,
 {
     /// Creates a new [`Analyzer`].
     pub fn new<LAnalyzerData, LRate, LParams>(
@@ -147,6 +150,7 @@ where
         sample_rate: LRate,
         params: LParams,
         edited_direction: L,
+        selected_node: LSelected,
     ) -> Handle<'_, Self>
     where
         LAnalyzerData: Lens<Target = Arc<Mutex<triple_buffer::Output<AnalyzerData>>>>,
@@ -159,6 +163,7 @@ where
             params: params.get(cx),
             edited_direction,
             drag: None,
+            selected_node,
         }
         .build(
             cx,
@@ -297,9 +302,10 @@ fn end_gesture(cx: &mut EventContext, param_ptr: ParamPtr) {
     cx.emit(RawParamEvent::EndSetParameter(param_ptr));
 }
 
-impl<L> View for Analyzer<L>
+impl<L, LSelected> View for Analyzer<L, LSelected>
 where
     L: 'static + Lens<Target = CompressorDirection>,
+    LSelected: 'static + Lens<Target = Option<usize>>,
 {
     fn element(&self) -> Option<&'static str> {
         Some("analyzer")
@@ -327,9 +333,12 @@ where
                         start_cursor: (x, y),
                     });
 
+                    cx.emit(EditorEvent::SelectNode(Some(node_index)));
                     cx.capture();
                     cx.set_active(true);
                     meta.consume();
+                } else {
+                    cx.emit(EditorEvent::SelectNode(None));
                 }
             }
             WindowEvent::MouseUp(MouseButton::Left) => {
@@ -415,11 +424,19 @@ where
                 let node = &self.nodes().nodes[node_index];
                 set_param(cx, node.center_frequency.as_ptr(), frequency);
                 set_param(cx, node.gain_db.as_ptr(), 0.0);
+                // Deleting a node only switches its type off, so a reused slot would otherwise
+                // inherit whatever target it had before
+                set_param(
+                    cx,
+                    node.target.as_ptr(),
+                    EqNodeTarget::Both.to_index() as f32,
+                );
                 set_param(
                     cx,
                     node.node_type.as_ptr(),
                     EqNodeType::Bell.to_index() as f32,
                 );
+                cx.emit(EditorEvent::SelectNode(Some(node_index)));
 
                 meta.consume();
             }
@@ -434,6 +451,7 @@ where
         }
 
         let edited_direction = self.edited_direction.get(cx);
+        let selected_node = self.selected_node.get(cx);
 
         // The analyzer data is pulled directly from the spectral `CompressorBank`
         let mut analyzer_data = self.analyzer_data.lock().unwrap();
@@ -443,7 +461,7 @@ where
         draw_grid(cx, canvas);
         draw_spectrum(cx, canvas, analyzer_data, nyquist);
         draw_threshold_curve(cx, canvas, analyzer_data, edited_direction);
-        draw_nodes(cx, canvas, analyzer_data, edited_direction);
+        draw_nodes(cx, canvas, analyzer_data, edited_direction, selected_node);
         draw_gain_reduction(cx, canvas, analyzer_data, nyquist);
 
         // Draw the border last
@@ -674,6 +692,7 @@ fn draw_nodes(
     canvas: &mut Canvas,
     analyzer_data: &AnalyzerData,
     edited_direction: CompressorDirection,
+    selected_node: Option<usize>,
 ) {
     let bounds = cx.bounds();
     let scale_factor = cx.scale_factor();
@@ -706,8 +725,8 @@ fn draw_nodes(
         let curve = Curve::new(curve_params);
         let eq_curve = EqCurve::new(eq_params, direction);
 
-        for node in &eq_params.nodes {
-            if node.node_type == EqNodeType::Off {
+        for (index, node) in eq_params.nodes.iter().enumerate() {
+            if node.node_type == EqNodeType::Off || !node.target.applies_to(direction) {
                 continue;
             }
 
@@ -724,8 +743,16 @@ fn draw_nodes(
             let x = bounds.x + (bounds.w * t);
             let y = bounds.y + (bounds.h * (1.0 - y_t));
 
+            // The selected node is drawn larger so it's obvious which one the inspector below
+            // the graph is editing
+            let radius = if selected_node == Some(index) {
+                NODE_RADIUS * 1.6
+            } else {
+                NODE_RADIUS
+            };
+
             let mut path = vg::Path::new();
-            path.circle(x, y, NODE_RADIUS * scale_factor);
+            path.circle(x, y, radius * scale_factor);
 
             // A filled center with a ring around it stays legible against both the dark background
             // and the bright spectrum
