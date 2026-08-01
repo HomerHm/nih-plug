@@ -22,9 +22,11 @@ use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use std::sync::{Arc, Mutex};
 
 use self::analyzer::{format_frequency, frequency_to_t, Analyzer, FREQUENCY_TICKS};
-use self::param_link::{param_ptr_by_id, ParamLink};
+use self::param_link::{param_ptr_by_id, param_ptr_pairs, ParamLink};
 use crate::analyzer::AnalyzerData;
+use crate::compressor_bank::{ThresholdCurveParams, NUM_CHAINS};
 use crate::eq_curve::{CompressorDirection, EqNodeParams, EqNodeType};
+use crate::StereoMode;
 use crate::{SpectralCompressor, SpectralCompressorParams};
 
 mod analyzer;
@@ -80,7 +82,9 @@ impl nih_plug_vizia::vizia::prelude::Data for CompressorDirection {
 
 /// Events the editor handles itself, rather than passing on to the parameters.
 pub enum EditorEvent {
-    /// Switch which curve the analyzer edits.
+    /// Switch which chain the analyzer edits.
+    SelectChain(usize),
+    /// Switch which curve within that chain the analyzer edits.
     SelectDirection(CompressorDirection),
     /// Select a node for the inspector below the analyzer, or clear the selection.
     SelectNode(Option<usize>),
@@ -97,6 +101,8 @@ pub struct Data {
     /// Which curve the analyzer edits. Editor state rather than a parameter, since it changes
     /// nothing about the sound.
     pub(crate) edited_direction: CompressorDirection,
+    /// Which chain the analyzer edits. What it means depends on the stereo mode.
+    pub(crate) edited_chain: usize,
     /// The node the inspector below the analyzer is editing, if any.
     pub(crate) selected_node: Option<usize>,
 }
@@ -104,6 +110,11 @@ pub struct Data {
 impl Model for Data {
     fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
         event.map(|editor_event, _| match editor_event {
+            EditorEvent::SelectChain(chain_idx) => {
+                self.edited_chain = *chain_idx;
+                // A node index only means anything within one chain's bank
+                self.selected_node = None;
+            }
             EditorEvent::SelectDirection(direction) => self.edited_direction = *direction,
             EditorEvent::SelectNode(node_index) => self.selected_node = *node_index,
         });
@@ -153,15 +164,14 @@ pub(crate) fn create(editor_state: Arc<ViziaState>, editor_data: Data) -> Option
 fn param_links(cx: &mut Context, content: impl FnOnce(&mut Context)) {
     let params = Data::params.get(cx);
 
-    // Downwards leads, so switching the link on pulls the upwards curve onto the downwards one
-    let curve_pairs = ["curve_center", "curve_slope", "curve_curve"]
+    // Downwards leads, so switching the link on pulls the upwards curve onto the downwards one.
+    // Every chain is paired, not just the one on screen, so switching chains can't reveal a pair
+    // that quietly drifted apart while the link was on.
+    let curve_pairs = params
+        .threshold
+        .chains
         .iter()
-        .map(|id| {
-            (
-                param_ptr_by_id(&params.compressors.downwards, id),
-                param_ptr_by_id(&params.compressors.upwards, id),
-            )
-        })
+        .flat_map(|chain| param_ptr_pairs(&chain.downwards, &chain.upwards))
         .collect();
 
     let curve_link_ptr = param_ptr_by_id(&params.threshold, "thresh_link");
@@ -214,6 +224,7 @@ fn analyzer(cx: &mut Context) {
             Data::params,
             Data::edited_direction,
             Data::selected_node,
+            Data::edited_chain,
         )
         // Soaks up all vertical space the controls below don't need
         .height(Stretch(1.0));
@@ -226,11 +237,40 @@ fn analyzer(cx: &mut Context) {
     .right(Pixels(12.0));
 }
 
-/// The buttons picking which curve the analyzer edits.
+/// The buttons picking which chain and which curve the analyzer edits.
 ///
-/// These sit directly above the graph they act on. Stage 4's chain selector belongs next to them.
+/// These sit directly above the graph they act on. Keeping this a selection is what stops the
+/// chains from doubling the number of controls on screen: everything below shows the chain that's
+/// picked here.
 fn direction_selector(cx: &mut Context) {
     HStack::new(cx, |cx| {
+        for chain_idx in 0..NUM_CHAINS {
+            Button::new(
+                cx,
+                move |cx| cx.emit(EditorEvent::SelectChain(chain_idx)),
+                move |cx| {
+                    // The chains are only left/right or mid/side depending on the stereo mode, so
+                    // the label follows it rather than being fixed
+                    Label::new(
+                        cx,
+                        Data::params.map(move |p| {
+                            match (p.global.stereo_mode.value(), chain_idx) {
+                                (StereoMode::MidSide, 0) => "Mid",
+                                (StereoMode::MidSide, _) => "Side",
+                                (_, 0) => "Left",
+                                (_, _) => "Right",
+                            }
+                        }),
+                    )
+                    .font_size(12.0)
+                },
+            )
+            .checked(Data::edited_chain.map(move |edited| *edited == chain_idx))
+            .class("direction-button");
+        }
+
+        Element::new(cx).width(Pixels(16.0));
+
         for direction in [CompressorDirection::Upwards, CompressorDirection::Downwards] {
             Button::new(
                 cx,
@@ -309,8 +349,8 @@ fn compressor_columns(cx: &mut Context) {
             .bottom(Pixels(4.0));
 
         HStack::new(cx, |cx| {
-            compressor_column(cx, "Upwards");
-            compressor_column(cx, "Downwards");
+            compressor_column(cx, CompressorDirection::Upwards);
+            compressor_column(cx, CompressorDirection::Downwards);
         })
         .height(Auto);
     })
@@ -320,12 +360,40 @@ fn compressor_columns(cx: &mut Context) {
 
 /// One compressor's column. `direction` is both the heading and the parameter name prefix that
 /// gets stripped from each row's label.
-fn compressor_column(cx: &mut Context, direction: &'static str) {
-    make_column(cx, direction, move |cx| {
+fn compressor_column(cx: &mut Context, direction: CompressorDirection) {
+    make_column(cx, direction.name(), move |cx| {
+        // The threshold curve belongs to the selected chain, so these have to be rebuilt whenever
+        // that changes. The compression settings below them are shared and don't.
+        Binding::new(cx, Data::edited_chain, move |cx, chain| {
+            let chain_idx = chain.get(cx);
+            let params = Data::params;
+
+            labelled_row(cx, "Thresh Center", move |cx| {
+                ParamSlider::new(cx, params, move |p| {
+                    &chain_curve(p, chain_idx, direction).center_frequency
+                });
+            });
+            labelled_row(cx, "Thresh Slope", move |cx| {
+                ParamSlider::new(cx, params, move |p| {
+                    &chain_curve(p, chain_idx, direction).curve_slope
+                });
+            });
+            labelled_row(cx, "Thresh Curve", move |cx| {
+                ParamSlider::new(cx, params, move |p| {
+                    &chain_curve(p, chain_idx, direction).curve_curve
+                });
+            });
+            labelled_row(cx, "Offset", move |cx| {
+                ParamSlider::new(cx, params, move |p| {
+                    &chain_curve(p, chain_idx, direction).threshold_offset_db
+                });
+            });
+        });
+
         // We don't want to show the 'Upwards'/'Downwards' prefix here, but it should still be in
         // the parameter name so the parameter list makes sense
         let compressor_params = compressor_params_lens(direction);
-        let strip_prefix = format!("{direction} ");
+        let strip_prefix = format!("{} ", direction.name());
         GenericUi::new_custom(cx, compressor_params, move |cx, param_ptr| {
             HStack::new(cx, |cx| {
                 Label::new(
@@ -360,22 +428,35 @@ fn make_column(cx: &mut Context, title: &str, contents: impl FnOnce(&mut Context
     .height(Auto);
 }
 
-/// The threshold curve's EQ nodes, one section per compressor.
-///
-/// These sit below the four control columns and span the full width, because a node needs four
-/// controls and cramming those into a 330 pixel column would leave them unusably narrow. One row
-/// per node also keeps this section six rows tall instead of twenty-four.
-///
-/// This whole section is temporary scaffolding: it exists so the node maths can be driven and
-/// verified before the nodes become draggable on the analyzer itself, and should go away once
-/// they are.
+/// One chain's threshold curve for one compressor.
+fn chain_curve(
+    params: &SpectralCompressorParams,
+    chain_idx: usize,
+    direction: CompressorDirection,
+) -> &ThresholdCurveParams {
+    let chain = &params.threshold.chains[chain_idx];
+    match direction {
+        CompressorDirection::Upwards => &chain.upwards,
+        CompressorDirection::Downwards => &chain.downwards,
+    }
+}
+
+/// One row of the generic-UI-styled parameter list, with a label on the left.
+fn labelled_row(cx: &mut Context, label: &'static str, widget: impl FnOnce(&mut Context)) {
+    HStack::new(cx, |cx| {
+        Label::new(cx, label).class("label");
+        widget(cx);
+    })
+    .class("row");
+}
+
 /// A lens to one compressor's parameters, picked by the same name used for its heading.
 fn compressor_params_lens(
-    direction: &'static str,
+    direction: CompressorDirection,
 ) -> impl Lens<Target = Arc<crate::compressor_bank::CompressorParams>> {
     Data::params.map(move |p| match direction {
-        "Upwards" => p.compressors.upwards.clone(),
-        _ => p.compressors.downwards.clone(),
+        CompressorDirection::Upwards => p.compressors.upwards.clone(),
+        CompressorDirection::Downwards => p.compressors.downwards.clone(),
     })
 }
 
@@ -389,6 +470,7 @@ fn compressor_params_lens(
 fn node_inspector(cx: &mut Context) {
     HStack::new(cx, |cx| {
         Binding::new(cx, Data::selected_node, |cx, selected| {
+            let chain_idx = Data::edited_chain.get(cx);
             let Some(index) = selected.get(cx) else {
                 Label::new(
                     cx,
@@ -407,20 +489,28 @@ fn node_inspector(cx: &mut Context) {
                 .bottom(Stretch(1.0));
 
             let params = Data::params;
-            ParamSlider::new(cx, params, move |p| &p.threshold.eq.nodes[index].node_type)
-                .set_style(ParamSliderStyle::FromLeft)
-                .width(Pixels(150.0));
-            ParamSlider::new(cx, params, move |p| &p.threshold.eq.nodes[index].target)
-                .set_style(ParamSliderStyle::FromLeft)
-                .width(Pixels(120.0));
             ParamSlider::new(cx, params, move |p| {
-                &p.threshold.eq.nodes[index].center_frequency
+                &p.threshold.chains[chain_idx].eq.nodes[index].node_type
+            })
+            .set_style(ParamSliderStyle::FromLeft)
+            .width(Pixels(150.0));
+            ParamSlider::new(cx, params, move |p| {
+                &p.threshold.chains[chain_idx].eq.nodes[index].target
+            })
+            .set_style(ParamSliderStyle::FromLeft)
+            .width(Pixels(120.0));
+            ParamSlider::new(cx, params, move |p| {
+                &p.threshold.chains[chain_idx].eq.nodes[index].center_frequency
             })
             .width(Pixels(110.0));
-            ParamSlider::new(cx, params, move |p| &p.threshold.eq.nodes[index].gain_db)
-                .width(Pixels(110.0));
-            ParamSlider::new(cx, params, move |p| &p.threshold.eq.nodes[index].q)
-                .width(Pixels(90.0));
+            ParamSlider::new(cx, params, move |p| {
+                &p.threshold.chains[chain_idx].eq.nodes[index].gain_db
+            })
+            .width(Pixels(110.0));
+            ParamSlider::new(cx, params, move |p| {
+                &p.threshold.chains[chain_idx].eq.nodes[index].q
+            })
+            .width(Pixels(90.0));
 
             Button::new(
                 cx,
@@ -433,6 +523,7 @@ fn node_inspector(cx: &mut Context) {
                         .expect("EqNodeType has no Off variant, this is a bug");
                     set_node_variant(
                         cx,
+                        chain_idx,
                         index,
                         |node| node.node_type.as_ptr(),
                         off_index,
@@ -455,6 +546,7 @@ fn node_inspector(cx: &mut Context) {
 /// Set one of a node's enum parameters to the variant at `index`.
 fn set_node_variant(
     cx: &mut EventContext,
+    chain_idx: usize,
     node_index: usize,
     param_ptr: fn(&EqNodeParams) -> ParamPtr,
     index: usize,
@@ -463,7 +555,7 @@ fn set_node_variant(
     let Some(data) = cx.data::<Data>() else {
         return;
     };
-    let ptr = param_ptr(&data.params.threshold.eq.nodes[node_index]);
+    let ptr = param_ptr(&data.params.threshold.chains[chain_idx].eq.nodes[node_index]);
 
     // An enum parameter's normalized range is divided evenly between its variants
     let normalized = index as f32 / (variant_count.saturating_sub(1).max(1)) as f32;

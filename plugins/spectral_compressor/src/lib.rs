@@ -355,6 +355,7 @@ impl Plugin for SpectralCompressor {
                 sample_rate: self.sample_rate.clone(),
 
                 edited_direction: eq_curve::CompressorDirection::Downwards,
+                edited_chain: 0,
                 selected_node: None,
             },
         )

@@ -111,7 +111,7 @@ const UPWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.55, 0.70, 0.
 
 /// A very analyzer showing the envelope followers as a magnitude spectrum with an overlay for the
 /// gain reduction.
-pub struct Analyzer<L, LSelected> {
+pub struct Analyzer<L, LSelected, LChain> {
     analyzer_data: Arc<Mutex<triple_buffer::Output<AnalyzerData>>>,
     sample_rate: Arc<AtomicF32>,
     /// Which compressor's curve the mouse acts on. Read during both drawing and event handling,
@@ -123,6 +123,8 @@ pub struct Analyzer<L, LSelected> {
     drag: Option<NodeDrag>,
     /// Which node the inspector below the graph is editing, so its handle can be marked.
     selected_node: LSelected,
+    /// Which chain the mouse acts on, alongside `edited_direction`.
+    edited_chain: LChain,
 }
 
 /// A node handle being dragged.
@@ -132,16 +134,17 @@ pub struct Analyzer<L, LSelected> {
 /// the cursor.
 struct NodeDrag {
     node_index: usize,
-    direction: CompressorDirection,
+    chain_idx: usize,
     start_frequency: f32,
     start_gain_db: f32,
     start_cursor: (f32, f32),
 }
 
-impl<L, LSelected> Analyzer<L, LSelected>
+impl<L, LSelected, LChain> Analyzer<L, LSelected, LChain>
 where
     L: Lens<Target = CompressorDirection>,
     LSelected: Lens<Target = Option<usize>>,
+    LChain: Lens<Target = usize>,
 {
     /// Creates a new [`Analyzer`].
     pub fn new<LAnalyzerData, LRate, LParams>(
@@ -151,11 +154,13 @@ where
         params: LParams,
         edited_direction: L,
         selected_node: LSelected,
+        edited_chain: LChain,
     ) -> Handle<'_, Self>
     where
         LAnalyzerData: Lens<Target = Arc<Mutex<triple_buffer::Output<AnalyzerData>>>>,
         LRate: Lens<Target = Arc<AtomicF32>>,
         LParams: Lens<Target = Arc<SpectralCompressorParams>>,
+        LChain: Lens<Target = usize>,
     {
         Self {
             analyzer_data: analyzer_data.get(cx),
@@ -164,6 +169,7 @@ where
             edited_direction,
             drag: None,
             selected_node,
+            edited_chain,
         }
         .build(
             cx,
@@ -172,29 +178,26 @@ where
         )
     }
 
-    /// The shared bank of nodes. Which curve a node deforms is its own `target` parameter.
-    fn nodes(&self) -> &EqBankParams {
-        &self.params.threshold.eq
+    /// The edited chain's bank of nodes. Which curve within it a node deforms is that node's own
+    /// `target` parameter.
+    fn nodes(&self, chain_idx: usize) -> &EqBankParams {
+        &self.params.threshold.chains[chain_idx].eq
     }
 
     /// Where a node's handle is drawn, as `[0, 1]` fractions of the analyzer's bounds. Mirrors
-    /// what [`draw_nodes()`] does, so hit testing and drawing cannot disagree.
     /// Where each active node's handle is drawn, as `[0, 1]` fractions of the analyzer's bounds.
     ///
-    /// Mirrors what [`draw_nodes()`] does, so hit testing and drawing cannot disagree about where
-    /// a node is. The composite curve is built once for the whole bank rather than once per node,
-    /// which matters because this runs on every click and scroll.
-    fn node_positions_t(&self, direction: CompressorDirection) -> Vec<(usize, f32, f32)> {
-        let compressor = match direction {
-            CompressorDirection::Upwards => &self.params.compressors.upwards,
-            CompressorDirection::Downwards => &self.params.compressors.downwards,
-        };
-
-        let curve_params = self.params.threshold.curve_params(compressor);
+    /// Mirrors what [`Self::draw_nodes()`] does, so hit testing and drawing cannot disagree about
+    /// where a node is. The composite curve is built once for the whole bank rather than once per
+    /// node, which matters because this runs on every click and scroll.
+    fn node_positions_t(
+        &self,
+        chain_idx: usize,
+        direction: CompressorDirection,
+    ) -> Vec<(usize, f32, f32)> {
+        let (curve_params, eq_params, offset_db) = curve_inputs(&self.params, chain_idx, direction);
         let curve = Curve::new(&curve_params);
-        let eq_params = self.nodes().snapshot();
         let eq_curve = EqCurve::new(&eq_params, direction);
-        let offset_db = compressor.threshold_offset_db.value();
 
         // Only nodes that deform this curve get a handle on it, so a node assigned to the other
         // compressor can't be grabbed here
@@ -220,8 +223,8 @@ where
     }
 
     /// The parameters a drag moves: the node's frequency and its gain.
-    fn drag_param_ptrs(&self, node_index: usize) -> (ParamPtr, ParamPtr) {
-        let node = &self.nodes().nodes[node_index];
+    fn drag_param_ptrs(&self, chain_idx: usize, node_index: usize) -> (ParamPtr, ParamPtr) {
+        let node = &self.nodes(chain_idx).nodes[node_index];
 
         (node.center_frequency.as_ptr(), node.gain_db.as_ptr())
     }
@@ -230,6 +233,7 @@ where
     fn node_at(
         &self,
         cx: &EventContext,
+        chain_idx: usize,
         direction: CompressorDirection,
         x: f32,
         y: f32,
@@ -238,7 +242,7 @@ where
         let radius = NODE_RADIUS * cx.scale_factor() * 2.0;
 
         let mut closest: Option<(usize, f32)> = None;
-        for (index, t_x, t_y) in self.node_positions_t(direction) {
+        for (index, t_x, t_y) in self.node_positions_t(chain_idx, direction) {
             let dx = (bounds.x + (bounds.w * t_x)) - x;
             let dy = (bounds.y + (bounds.h * t_y)) - y;
             let distance_squared = (dx * dx) + (dy * dy);
@@ -255,8 +259,8 @@ where
     }
 
     /// The first switched-off node, which is the one a double click turns on.
-    fn first_free_node(&self) -> Option<usize> {
-        self.nodes()
+    fn first_free_node(&self, chain_idx: usize) -> Option<usize> {
+        self.nodes(chain_idx)
             .nodes
             .iter()
             .position(|node| node.node_type.value() == EqNodeType::Off)
@@ -302,10 +306,11 @@ fn end_gesture(cx: &mut EventContext, param_ptr: ParamPtr) {
     cx.emit(RawParamEvent::EndSetParameter(param_ptr));
 }
 
-impl<L, LSelected> View for Analyzer<L, LSelected>
+impl<L, LSelected, LChain> View for Analyzer<L, LSelected, LChain>
 where
     L: 'static + Lens<Target = CompressorDirection>,
     LSelected: 'static + Lens<Target = Option<usize>>,
+    LChain: 'static + Lens<Target = usize>,
 {
     fn element(&self) -> Option<&'static str> {
         Some("analyzer")
@@ -313,13 +318,14 @@ where
 
     fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
         let direction = self.edited_direction.get(cx);
+        let chain_idx = self.edited_chain.get(cx);
 
         event.map(|window_event, meta| match window_event {
             WindowEvent::MouseDown(MouseButton::Left) => {
                 let (x, y) = (cx.mouse().cursorx, cx.mouse().cursory);
-                if let Some(node_index) = self.node_at(cx, direction, x, y) {
-                    let node = self.nodes().nodes[node_index].snapshot();
-                    let (frequency_ptr, gain_ptr) = self.drag_param_ptrs(node_index);
+                if let Some(node_index) = self.node_at(cx, chain_idx, direction, x, y) {
+                    let node = self.nodes(chain_idx).nodes[node_index].snapshot();
+                    let (frequency_ptr, gain_ptr) = self.drag_param_ptrs(chain_idx, node_index);
 
                     // One gesture spanning the whole drag, rather than one per mouse move
                     begin_gesture(cx, frequency_ptr);
@@ -327,7 +333,7 @@ where
 
                     self.drag = Some(NodeDrag {
                         node_index,
-                        direction,
+                        chain_idx,
                         start_frequency: node.center_frequency,
                         start_gain_db: node.gain_db,
                         start_cursor: (x, y),
@@ -343,7 +349,8 @@ where
             }
             WindowEvent::MouseUp(MouseButton::Left) => {
                 if let Some(drag) = self.drag.take() {
-                    let (frequency_ptr, gain_ptr) = self.drag_param_ptrs(drag.node_index);
+                    let (frequency_ptr, gain_ptr) =
+                        self.drag_param_ptrs(drag.chain_idx, drag.node_index);
                     end_gesture(cx, frequency_ptr);
                     end_gesture(cx, gain_ptr);
 
@@ -369,7 +376,8 @@ where
                 let gain_db =
                     drag.start_gain_db - (((y - drag.start_cursor.1) / bounds.h) * DB_RANGE);
 
-                let (frequency_ptr, gain_ptr) = self.drag_param_ptrs(drag.node_index);
+                let (frequency_ptr, gain_ptr) =
+                    self.drag_param_ptrs(drag.chain_idx, drag.node_index);
                 set_param_value(cx, frequency_ptr, ln_frequency.exp());
                 set_param_value(cx, gain_ptr, gain_db);
 
@@ -377,13 +385,13 @@ where
             }
             WindowEvent::MouseScroll(_scroll_x, scroll_y) => {
                 let (x, y) = (cx.mouse().cursorx, cx.mouse().cursory);
-                let Some(node_index) = self.node_at(cx, direction, x, y) else {
+                let Some(node_index) = self.node_at(cx, chain_idx, direction, x, y) else {
                     return;
                 };
 
                 // Scrolling over a handle adjusts its Q. Multiplying rather than adding keeps the
                 // steps feeling even across the parameter's skewed range.
-                let node = &self.nodes().nodes[node_index];
+                let node = &self.nodes(chain_idx).nodes[node_index];
                 let q = node.q.value() * SCROLL_Q_FACTOR.powf(*scroll_y);
                 set_param(cx, node.q.as_ptr(), q);
 
@@ -393,8 +401,8 @@ where
                 let (x, y) = (cx.mouse().cursorx, cx.mouse().cursory);
 
                 // Double clicking an existing node switches it off, which is how it gets deleted
-                if let Some(node_index) = self.node_at(cx, direction, x, y) {
-                    let node = &self.nodes().nodes[node_index];
+                if let Some(node_index) = self.node_at(cx, chain_idx, direction, x, y) {
+                    let node = &self.nodes(chain_idx).nodes[node_index];
                     set_param(
                         cx,
                         node.node_type.as_ptr(),
@@ -410,7 +418,7 @@ where
                 }
 
                 // Otherwise it creates one at the pointer, if there's a spare
-                let Some(node_index) = self.first_free_node() else {
+                let Some(node_index) = self.first_free_node(chain_idx) else {
                     return;
                 };
                 let bounds = cx.bounds();
@@ -421,7 +429,7 @@ where
                 let t = ((x - bounds.x) / bounds.w).clamp(0.0, 1.0);
                 let frequency = (LN_FREQ_RANGE_START_HZ + (LN_FREQ_RANGE * t)).exp();
 
-                let node = &self.nodes().nodes[node_index];
+                let node = &self.nodes(chain_idx).nodes[node_index];
                 set_param(cx, node.center_frequency.as_ptr(), frequency);
                 set_param(cx, node.gain_db.as_ptr(), 0.0);
                 // Deleting a node only switches its type off, so a reused slot would otherwise
@@ -452,6 +460,7 @@ where
 
         let edited_direction = self.edited_direction.get(cx);
         let selected_node = self.selected_node.get(cx);
+        let chain_idx = self.edited_chain.get(cx);
 
         // The analyzer data is pulled directly from the spectral `CompressorBank`
         let mut analyzer_data = self.analyzer_data.lock().unwrap();
@@ -460,8 +469,8 @@ where
 
         draw_grid(cx, canvas);
         draw_spectrum(cx, canvas, analyzer_data, nyquist);
-        self.draw_threshold_curves(cx, canvas, edited_direction);
-        self.draw_nodes(cx, canvas, edited_direction, selected_node);
+        self.draw_threshold_curves(cx, canvas, chain_idx, edited_direction);
+        self.draw_nodes(cx, canvas, chain_idx, edited_direction, selected_node);
         draw_gain_reduction(cx, canvas, analyzer_data, nyquist);
 
         // Draw the border last
@@ -486,10 +495,11 @@ where
     }
 }
 
-impl<L, LSelected> Analyzer<L, LSelected>
+impl<L, LSelected, LChain> Analyzer<L, LSelected, LChain>
 where
     L: 'static + Lens<Target = CompressorDirection>,
     LSelected: 'static + Lens<Target = Option<usize>>,
+    LChain: 'static + Lens<Target = usize>,
 {
     /// Overlays the threshold curves over the spectrum analyzer. The upwards and downwards curves
     /// can have different shapes as well as different offsets, so both are always drawn.
@@ -497,6 +507,7 @@ where
         &self,
         cx: &mut DrawContext,
         canvas: &mut Canvas,
+        chain_idx: usize,
         edited_direction: CompressorDirection,
     ) {
         let bounds = cx.bounds();
@@ -508,7 +519,8 @@ where
         let num_points = 100.min(bounds.w.ceil() as usize);
 
         for direction in [CompressorDirection::Upwards, CompressorDirection::Downwards] {
-            let (curve_params, eq_params, offset_db) = curve_inputs(&self.params, direction);
+            let (curve_params, eq_params, offset_db) =
+                curve_inputs(&self.params, chain_idx, direction);
             let curve = Curve::new(&curve_params);
             let eq_curve = EqCurve::new(&eq_params, direction);
 
@@ -558,6 +570,7 @@ where
         &self,
         cx: &mut DrawContext,
         canvas: &mut Canvas,
+        chain_idx: usize,
         edited_direction: CompressorDirection,
         selected_node: Option<usize>,
     ) {
@@ -572,7 +585,8 @@ where
 
         canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
         for direction in directions {
-            let (curve_params, eq_params, offset_db) = curve_inputs(&self.params, direction);
+            let (curve_params, eq_params, offset_db) =
+                curve_inputs(&self.params, chain_idx, direction);
             let curve = Curve::new(&curve_params);
             let eq_curve = EqCurve::new(&eq_params, direction);
 
@@ -834,17 +848,19 @@ fn draw_grid(cx: &mut DrawContext, canvas: &mut Canvas) {
 /// live whether or not audio is flowing.
 fn curve_inputs(
     params: &SpectralCompressorParams,
+    chain_idx: usize,
     direction: CompressorDirection,
 ) -> (CurveParams, EqCurveParams, f32) {
-    let compressor = match direction {
-        CompressorDirection::Upwards => &params.compressors.upwards,
-        CompressorDirection::Downwards => &params.compressors.downwards,
+    let chain = &params.threshold.chains[chain_idx];
+    let curve = match direction {
+        CompressorDirection::Upwards => &chain.upwards,
+        CompressorDirection::Downwards => &chain.downwards,
     };
 
     (
-        params.threshold.curve_params(compressor),
-        params.threshold.eq.snapshot(),
-        compressor.threshold_offset_db.value(),
+        params.threshold.curve_params(curve),
+        chain.eq.snapshot(),
+        curve.threshold_offset_db.value(),
     )
 }
 
