@@ -143,7 +143,7 @@ struct NodeDrag {
 impl<L, LSelected, LChain> Analyzer<L, LSelected, LChain>
 where
     L: Lens<Target = CompressorDirection>,
-    LSelected: Lens<Target = Option<usize>>,
+    LSelected: Lens<Target = Option<(usize, usize)>>,
     LChain: Lens<Target = usize>,
 {
     /// Creates a new [`Analyzer`].
@@ -309,7 +309,7 @@ fn end_gesture(cx: &mut EventContext, param_ptr: ParamPtr) {
 impl<L, LSelected, LChain> View for Analyzer<L, LSelected, LChain>
 where
     L: 'static + Lens<Target = CompressorDirection>,
-    LSelected: 'static + Lens<Target = Option<usize>>,
+    LSelected: 'static + Lens<Target = Option<(usize, usize)>>,
     LChain: 'static + Lens<Target = usize>,
 {
     fn element(&self) -> Option<&'static str> {
@@ -498,7 +498,7 @@ where
 impl<L, LSelected, LChain> Analyzer<L, LSelected, LChain>
 where
     L: 'static + Lens<Target = CompressorDirection>,
-    LSelected: 'static + Lens<Target = Option<usize>>,
+    LSelected: 'static + Lens<Target = Option<(usize, usize)>>,
     LChain: 'static + Lens<Target = usize>,
 {
     /// Overlays the threshold curves over the spectrum analyzer. The upwards and downwards curves
@@ -572,7 +572,7 @@ where
         canvas: &mut Canvas,
         chain_idx: usize,
         edited_direction: CompressorDirection,
-        selected_node: Option<usize>,
+        selected_node: Option<(usize, usize)>,
     ) {
         let bounds = cx.bounds();
         let scale_factor = cx.scale_factor();
@@ -619,7 +619,7 @@ where
 
                 // The selected node is drawn larger so it's obvious which one the inspector below
                 // the graph is editing
-                let radius = if is_edited && selected_node == Some(index) {
+                let radius = if is_edited && selected_node == Some((chain_idx, index)) {
                     NODE_RADIUS * 1.6
                 } else {
                     NODE_RADIUS

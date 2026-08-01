@@ -279,7 +279,8 @@ impl ThresholdCurveParams {
             .with_callback(set_update_thresholds.clone())
             // This includes the unit
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
-            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz())
+            .hide_in_generic_ui(),
             curve_slope: FloatParam::new(
                 format!("{name_prefix} Thresh Slope"),
                 0.0,
@@ -292,7 +293,8 @@ impl ThresholdCurveParams {
             )
             .with_callback(set_update_thresholds.clone())
             .with_unit(" dB/oct")
-            .with_step_size(0.01),
+            .with_step_size(0.01)
+            .hide_in_generic_ui(),
             curve_curve: FloatParam::new(
                 format!("{name_prefix} Thresh Curve"),
                 0.0,
@@ -305,7 +307,8 @@ impl ThresholdCurveParams {
             )
             .with_callback(set_update_thresholds.clone())
             .with_unit(" dB/oct²")
-            .with_step_size(0.01),
+            .with_step_size(0.01)
+            .hide_in_generic_ui(),
             threshold_offset_db: FloatParam::new(
                 format!("{name_prefix} Offset"),
                 0.0,
@@ -316,7 +319,8 @@ impl ThresholdCurveParams {
             )
             .with_callback(set_update_thresholds)
             .with_unit(" dB")
-            .with_step_size(0.1),
+            .with_step_size(0.1)
+            .hide_in_generic_ui(),
         }
     }
 }

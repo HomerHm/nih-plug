@@ -25,7 +25,7 @@ use self::analyzer::{format_frequency, frequency_to_t, Analyzer, FREQUENCY_TICKS
 use self::param_link::{param_ptr_by_id, param_ptr_pairs, ParamLink};
 use crate::analyzer::AnalyzerData;
 use crate::compressor_bank::{ThresholdCurveParams, NUM_CHAINS};
-use crate::eq_curve::{CompressorDirection, EqNodeParams, EqNodeType};
+use crate::eq_curve::{CompressorDirection, EqNodeParams, EqNodeType, MAX_EQ_NODES};
 use crate::StereoMode;
 use crate::{SpectralCompressor, SpectralCompressorParams};
 
@@ -86,7 +86,7 @@ pub enum EditorEvent {
     SelectChain(usize),
     /// Switch which curve within that chain the analyzer edits.
     SelectDirection(CompressorDirection),
-    /// Select a node for the inspector below the analyzer, or clear the selection.
+    /// Select a node in the current chain for the inspector below the analyzer, or clear it.
     SelectNode(Option<usize>),
 }
 
@@ -103,8 +103,9 @@ pub struct Data {
     pub(crate) edited_direction: CompressorDirection,
     /// Which chain the analyzer edits. What it means depends on the stereo mode.
     pub(crate) edited_chain: usize,
-    /// The node the inspector below the analyzer is editing, if any.
-    pub(crate) selected_node: Option<usize>,
+    /// The node the inspector below the analyzer is editing, as `(chain, node)`. The chain is part
+    /// of it because a node index only means something within one chain's bank.
+    pub(crate) selected_node: Option<(usize, usize)>,
 }
 
 impl Model for Data {
@@ -112,11 +113,12 @@ impl Model for Data {
         event.map(|editor_event, _| match editor_event {
             EditorEvent::SelectChain(chain_idx) => {
                 self.edited_chain = *chain_idx;
-                // A node index only means anything within one chain's bank
                 self.selected_node = None;
             }
             EditorEvent::SelectDirection(direction) => self.edited_direction = *direction,
-            EditorEvent::SelectNode(node_index) => self.selected_node = *node_index,
+            EditorEvent::SelectNode(node_index) => {
+                self.selected_node = node_index.map(|index| (self.edited_chain, index));
+            }
         });
     }
 }
@@ -362,33 +364,37 @@ fn compressor_columns(cx: &mut Context) {
 /// gets stripped from each row's label.
 fn compressor_column(cx: &mut Context, direction: CompressorDirection) {
     make_column(cx, direction.name(), move |cx| {
-        // The threshold curve belongs to the selected chain, so these have to be rebuilt whenever
-        // that changes. The compression settings below them are shared and don't.
-        Binding::new(cx, Data::edited_chain, move |cx, chain| {
-            let chain_idx = chain.get(cx);
+        // The threshold curve belongs to the selected chain. Every chain's rows are built and all
+        // but the selected one hidden, rather than rebuilding them inside a `Binding`: a binding's
+        // entity is ignored by the layout, so its children end up stacked at the origin.
+        for chain_idx in 0..NUM_CHAINS {
             let params = Data::params;
 
-            labelled_row(cx, "Thresh Center", move |cx| {
-                ParamSlider::new(cx, params, move |p| {
-                    &chain_curve(p, chain_idx, direction).center_frequency
+            VStack::new(cx, move |cx| {
+                labelled_row(cx, "Thresh Center", move |cx| {
+                    ParamSlider::new(cx, params, move |p| {
+                        &chain_curve(p, chain_idx, direction).center_frequency
+                    });
                 });
-            });
-            labelled_row(cx, "Thresh Slope", move |cx| {
-                ParamSlider::new(cx, params, move |p| {
-                    &chain_curve(p, chain_idx, direction).curve_slope
+                labelled_row(cx, "Thresh Slope", move |cx| {
+                    ParamSlider::new(cx, params, move |p| {
+                        &chain_curve(p, chain_idx, direction).curve_slope
+                    });
                 });
-            });
-            labelled_row(cx, "Thresh Curve", move |cx| {
-                ParamSlider::new(cx, params, move |p| {
-                    &chain_curve(p, chain_idx, direction).curve_curve
+                labelled_row(cx, "Thresh Curve", move |cx| {
+                    ParamSlider::new(cx, params, move |p| {
+                        &chain_curve(p, chain_idx, direction).curve_curve
+                    });
                 });
-            });
-            labelled_row(cx, "Offset", move |cx| {
-                ParamSlider::new(cx, params, move |p| {
-                    &chain_curve(p, chain_idx, direction).threshold_offset_db
+                labelled_row(cx, "Offset", move |cx| {
+                    ParamSlider::new(cx, params, move |p| {
+                        &chain_curve(p, chain_idx, direction).threshold_offset_db
+                    });
                 });
-            });
-        });
+            })
+            .height(Auto)
+            .display(Data::edited_chain.map(move |edited| *edited == chain_idx));
+        }
 
         // We don't want to show the 'Upwards'/'Downwards' prefix here, but it should still be in
         // the parameter name so the parameter list makes sense
@@ -469,75 +475,84 @@ fn compressor_params_lens(
 /// already takes a keyboard value on a double click.
 fn node_inspector(cx: &mut Context) {
     HStack::new(cx, |cx| {
-        Binding::new(cx, Data::selected_node, |cx, selected| {
-            let chain_idx = Data::edited_chain.get(cx);
-            let Some(index) = selected.get(cx) else {
-                Label::new(
-                    cx,
-                    "Double click the graph to add a node, or click one to edit it",
-                )
-                .color(DARKER_GRAY)
-                .font_size(12.0)
-                .top(Stretch(1.0))
-                .bottom(Stretch(1.0));
-                return;
-            };
+        Label::new(
+            cx,
+            "Double click the graph to add a node, or click one to edit it",
+        )
+        .color(DARKER_GRAY)
+        .font_size(12.0)
+        .top(Stretch(1.0))
+        .bottom(Stretch(1.0))
+        .display(Data::selected_node.map(|selected| selected.is_none()));
 
-            Label::new(cx, &format!("Node {}", index + 1))
-                .width(Pixels(60.0))
-                .top(Stretch(1.0))
-                .bottom(Stretch(1.0));
+        // As with the compressor columns, every row is built and all but the selected one hidden.
+        // A `Binding` marks its entity as ignored by the layout, so using one as a container
+        // leaves its children stacked on top of each other at the origin.
+        for chain_idx in 0..NUM_CHAINS {
+            for index in 0..MAX_EQ_NODES {
+                HStack::new(cx, move |cx| {
+                    Label::new(cx, &format!("Node {}", index + 1))
+                        .width(Pixels(60.0))
+                        .top(Stretch(1.0))
+                        .bottom(Stretch(1.0));
 
-            let params = Data::params;
-            ParamSlider::new(cx, params, move |p| {
-                &p.threshold.chains[chain_idx].eq.nodes[index].node_type
-            })
-            .set_style(ParamSliderStyle::FromLeft)
-            .width(Pixels(150.0));
-            ParamSlider::new(cx, params, move |p| {
-                &p.threshold.chains[chain_idx].eq.nodes[index].target
-            })
-            .set_style(ParamSliderStyle::FromLeft)
-            .width(Pixels(120.0));
-            ParamSlider::new(cx, params, move |p| {
-                &p.threshold.chains[chain_idx].eq.nodes[index].center_frequency
-            })
-            .width(Pixels(110.0));
-            ParamSlider::new(cx, params, move |p| {
-                &p.threshold.chains[chain_idx].eq.nodes[index].gain_db
-            })
-            .width(Pixels(110.0));
-            ParamSlider::new(cx, params, move |p| {
-                &p.threshold.chains[chain_idx].eq.nodes[index].q
-            })
-            .width(Pixels(90.0));
+                    let params = Data::params;
+                    ParamSlider::new(cx, params, move |p| {
+                        &p.threshold.chains[chain_idx].eq.nodes[index].node_type
+                    })
+                    .set_style(ParamSliderStyle::FromLeft)
+                    .width(Pixels(150.0));
+                    ParamSlider::new(cx, params, move |p| {
+                        &p.threshold.chains[chain_idx].eq.nodes[index].target
+                    })
+                    .set_style(ParamSliderStyle::FromLeft)
+                    .width(Pixels(120.0));
+                    ParamSlider::new(cx, params, move |p| {
+                        &p.threshold.chains[chain_idx].eq.nodes[index].center_frequency
+                    })
+                    .width(Pixels(110.0));
+                    ParamSlider::new(cx, params, move |p| {
+                        &p.threshold.chains[chain_idx].eq.nodes[index].gain_db
+                    })
+                    .width(Pixels(110.0));
+                    ParamSlider::new(cx, params, move |p| {
+                        &p.threshold.chains[chain_idx].eq.nodes[index].q
+                    })
+                    .width(Pixels(90.0));
 
-            Button::new(
-                cx,
-                move |cx| {
-                    // Switching a node off is what removing it means. Its other parameters stay
-                    // put, so the host's automation lanes don't shift around underneath the user.
-                    let off_index = EqNodeType::variants()
-                        .iter()
-                        .position(|name| *name == "Off")
-                        .expect("EqNodeType has no Off variant, this is a bug");
-                    set_node_variant(
+                    Button::new(
                         cx,
-                        chain_idx,
-                        index,
-                        |node| node.node_type.as_ptr(),
-                        off_index,
-                        EqNodeType::variants().len(),
-                    );
-                    cx.emit(EditorEvent::SelectNode(None));
-                },
-                |cx| Label::new(cx, "Delete").font_size(12.0),
-            )
-            .class("direction-button");
-        });
+                        move |cx| {
+                            // Switching a node off is what removing it means. Its other parameters
+                            // stay put, so the host's automation lanes don't shift around
+                            // underneath the user.
+                            let off_index = EqNodeType::variants()
+                                .iter()
+                                .position(|name| *name == "Off")
+                                .expect("EqNodeType has no Off variant, this is a bug");
+                            set_node_variant(
+                                cx,
+                                chain_idx,
+                                index,
+                                |node| node.node_type.as_ptr(),
+                                off_index,
+                                EqNodeType::variants().len(),
+                            );
+                            cx.emit(EditorEvent::SelectNode(None));
+                        },
+                        |cx| Label::new(cx, "Delete").font_size(12.0),
+                    )
+                    .class("direction-button");
+                })
+                .height(Auto)
+                .col_between(Pixels(4.0))
+                .display(
+                    Data::selected_node.map(move |selected| *selected == Some((chain_idx, index))),
+                );
+            }
+        }
     })
     .height(Pixels(24.0))
-    .col_between(Pixels(4.0))
     .child_left(Stretch(1.0))
     .child_right(Stretch(1.0))
     .top(Pixels(4.0));

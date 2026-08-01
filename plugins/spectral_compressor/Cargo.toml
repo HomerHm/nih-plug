@@ -1,6 +1,6 @@
 [package]
 name = "spectral_compressor"
-version = "0.4.3-hm.12"
+version = "0.4.3-hm.13"
 edition = "2021"
 authors = ["Robbert van der Helm <mail@robbertvanderhelm.nl>"]
 license = "GPL-3.0-or-later"
