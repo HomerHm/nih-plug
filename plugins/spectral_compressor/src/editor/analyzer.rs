@@ -25,7 +25,7 @@ use super::EditorEvent;
 use crate::analyzer::AnalyzerData;
 use crate::curve::{Curve, CurveParams};
 use crate::eq_curve::CompressorDirection;
-use crate::eq_curve::{EqBankParams, EqCurve, EqNodeTarget, EqNodeType};
+use crate::eq_curve::{EqBankParams, EqCurve, EqCurveParams, EqNodeTarget, EqNodeType};
 use crate::SpectralCompressorParams;
 use nih_plug::prelude::{Enum, Param, ParamPtr};
 use nih_plug_vizia::widgets::RawParamEvent;
@@ -460,8 +460,8 @@ where
 
         draw_grid(cx, canvas);
         draw_spectrum(cx, canvas, analyzer_data, nyquist);
-        draw_threshold_curve(cx, canvas, analyzer_data, edited_direction);
-        draw_nodes(cx, canvas, analyzer_data, edited_direction, selected_node);
+        self.draw_threshold_curves(cx, canvas, edited_direction);
+        self.draw_nodes(cx, canvas, edited_direction, selected_node);
         draw_gain_reduction(cx, canvas, analyzer_data, nyquist);
 
         // Draw the border last
@@ -483,6 +483,148 @@ where
 
         let paint = vg::Paint::color(border_color).with_line_width(border_width);
         canvas.stroke_path(&path, &paint);
+    }
+}
+
+impl<L, LSelected> Analyzer<L, LSelected>
+where
+    L: 'static + Lens<Target = CompressorDirection>,
+    LSelected: 'static + Lens<Target = Option<usize>>,
+{
+    /// Overlays the threshold curves over the spectrum analyzer. The upwards and downwards curves
+    /// can have different shapes as well as different offsets, so both are always drawn.
+    fn draw_threshold_curves(
+        &self,
+        cx: &mut DrawContext,
+        canvas: &mut Canvas,
+        edited_direction: CompressorDirection,
+    ) {
+        let bounds = cx.bounds();
+
+        let line_width = cx.scale_factor() * 3.0;
+        // This can be done slightly cleverer but for our purposes drawing line segments that are
+        // either 1 pixel apart or that split the curve up into 100 segments (whichever results in
+        // the least amount of line segments) should be sufficient
+        let num_points = 100.min(bounds.w.ceil() as usize);
+
+        for direction in [CompressorDirection::Upwards, CompressorDirection::Downwards] {
+            let (curve_params, eq_params, offset_db) = curve_inputs(&self.params, direction);
+            let curve = Curve::new(&curve_params);
+            let eq_curve = EqCurve::new(&eq_params, direction);
+
+            let color = match direction {
+                CompressorDirection::Upwards => UPWARDS_THRESHOLD_CURVE_COLOR,
+                CompressorDirection::Downwards => DOWNWARDS_THRESHOLD_CURVE_COLOR,
+            };
+            let paint = vg::Paint::color(curve_color(color, direction == edited_direction))
+                .with_line_width(line_width);
+
+            let mut path = vg::Path::new();
+            for i in 0..num_points {
+                let x_t = i as f32 / (num_points - 1) as f32;
+                let ln_freq = LN_FREQ_RANGE_START_HZ + (LN_FREQ_RANGE * x_t);
+
+                // Evaluating the curve results in a value in dB, which must then be mapped to the
+                // same scale used in `draw_spectrum()`. The nodes are evaluated the same way the
+                // compressor bank does it, so the drawn curve matches the audible one.
+                let y_db =
+                    curve.evaluate_ln(ln_freq) + eq_curve.evaluate_db(ln_freq.exp()) + offset_db;
+                let y_t = db_to_unclamped_t(y_db);
+
+                let physical_x_pos = bounds.x + (bounds.w * x_t);
+                // This value increases from bottom to top
+                let physical_y_pos = bounds.y + (bounds.h * (1.0 - y_t));
+
+                if i == 0 {
+                    path.move_to(physical_x_pos, physical_y_pos);
+                } else {
+                    path.line_to(physical_x_pos, physical_y_pos);
+                }
+            }
+
+            // This does a way better job at cutting off the tops and bottoms of the graph than we
+            // could do by hand
+            canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
+            canvas.stroke_path(&path, &paint);
+            canvas.reset_scissor();
+        }
+    }
+
+    /// Draw a handle on each active EQ node, sitting on the curve it belongs to.
+    ///
+    /// The handles are placed by evaluating the same curve that gets drawn, so a node's handle
+    /// always sits exactly on its own curve rather than near it.
+    fn draw_nodes(
+        &self,
+        cx: &mut DrawContext,
+        canvas: &mut Canvas,
+        edited_direction: CompressorDirection,
+        selected_node: Option<usize>,
+    ) {
+        let bounds = cx.bounds();
+        let scale_factor = cx.scale_factor();
+
+        // The edited curve's handles go down last so they end up on top, where they can be grabbed
+        let mut directions = [CompressorDirection::Upwards, CompressorDirection::Downwards];
+        if directions[0] == edited_direction {
+            directions.swap(0, 1);
+        }
+
+        canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
+        for direction in directions {
+            let (curve_params, eq_params, offset_db) = curve_inputs(&self.params, direction);
+            let curve = Curve::new(&curve_params);
+            let eq_curve = EqCurve::new(&eq_params, direction);
+
+            let is_edited = direction == edited_direction;
+            let color = curve_color(
+                match direction {
+                    CompressorDirection::Upwards => UPWARDS_THRESHOLD_CURVE_COLOR,
+                    CompressorDirection::Downwards => DOWNWARDS_THRESHOLD_CURVE_COLOR,
+                },
+                is_edited,
+            );
+
+            for (index, node) in eq_params.nodes.iter().enumerate() {
+                if node.node_type == EqNodeType::Off || !node.target.applies_to(direction) {
+                    continue;
+                }
+
+                let t = frequency_to_t(node.center_frequency);
+                if !(0.0..=1.0).contains(&t) {
+                    continue;
+                }
+
+                let y_db = curve.evaluate_ln(node.center_frequency.ln())
+                    + eq_curve.evaluate_db(node.center_frequency)
+                    + offset_db;
+                let y_t = db_to_unclamped_t(y_db);
+
+                let x = bounds.x + (bounds.w * t);
+                let y = bounds.y + (bounds.h * (1.0 - y_t));
+
+                // The selected node is drawn larger so it's obvious which one the inspector below
+                // the graph is editing
+                let radius = if is_edited && selected_node == Some(index) {
+                    NODE_RADIUS * 1.6
+                } else {
+                    NODE_RADIUS
+                };
+
+                let mut path = vg::Path::new();
+                path.circle(x, y, radius * scale_factor);
+
+                // A filled center with a ring around it stays legible against both the dark
+                // background and the bright spectrum
+                canvas.fill_path(&path, &vg::Paint::color(color));
+                canvas.stroke_path(
+                    &path,
+                    &vg::Paint::color(vg::Color::rgbaf(0.05, 0.05, 0.05, 0.9))
+                        .with_line_width(1.5 * scale_factor),
+                );
+            }
+        }
+        canvas.reset_scissor();
     }
 }
 
@@ -683,169 +825,30 @@ fn draw_grid(cx: &mut DrawContext, canvas: &mut Canvas) {
     canvas.stroke_path(&path, &paint);
 }
 
-/// Draw a handle on each active EQ node, sitting on the curve it belongs to.
+/// The curve, node bank and offset for one compressor, read straight from the parameters.
 ///
-/// The handles are placed by evaluating the same curve that gets drawn, so a node's handle always
-/// sits exactly on its own curve rather than near it.
-fn draw_nodes(
-    cx: &mut DrawContext,
-    canvas: &mut Canvas,
-    analyzer_data: &AnalyzerData,
-    edited_direction: CompressorDirection,
-    selected_node: Option<usize>,
-) {
-    let bounds = cx.bounds();
-    let scale_factor = cx.scale_factor();
-
-    let (upwards_offset_db, downwards_offset_db) = analyzer_data.curve_offsets_db;
-    let mut curves = [
-        (
-            &analyzer_data.upwards_curve_params,
-            &analyzer_data.eq_params,
-            upwards_offset_db,
-            UPWARDS_THRESHOLD_CURVE_COLOR,
-            CompressorDirection::Upwards,
-        ),
-        (
-            &analyzer_data.downwards_curve_params,
-            &analyzer_data.eq_params,
-            downwards_offset_db,
-            DOWNWARDS_THRESHOLD_CURVE_COLOR,
-            CompressorDirection::Downwards,
-        ),
-    ];
-    // Drawing the edited curve's handles last keeps them on top where they can be grabbed
-    if curves[0].4 == edited_direction {
-        curves.swap(0, 1);
-    }
-
-    canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
-    for (curve_params, eq_params, offset_db, color, direction) in curves {
-        let color = curve_color(color, direction == edited_direction);
-        let curve = Curve::new(curve_params);
-        let eq_curve = EqCurve::new(eq_params, direction);
-
-        for (index, node) in eq_params.nodes.iter().enumerate() {
-            if node.node_type == EqNodeType::Off || !node.target.applies_to(direction) {
-                continue;
-            }
-
-            let t = frequency_to_t(node.center_frequency);
-            if !(0.0..=1.0).contains(&t) {
-                continue;
-            }
-
-            let y_db = curve.evaluate_ln(node.center_frequency.ln())
-                + eq_curve.evaluate_db(node.center_frequency)
-                + offset_db;
-            let y_t = db_to_unclamped_t(y_db);
-
-            let x = bounds.x + (bounds.w * t);
-            let y = bounds.y + (bounds.h * (1.0 - y_t));
-
-            // The selected node is drawn larger so it's obvious which one the inspector below
-            // the graph is editing
-            let radius = if selected_node == Some(index) {
-                NODE_RADIUS * 1.6
-            } else {
-                NODE_RADIUS
-            };
-
-            let mut path = vg::Path::new();
-            path.circle(x, y, radius * scale_factor);
-
-            // A filled center with a ring around it stays legible against both the dark background
-            // and the bright spectrum
-            canvas.fill_path(&path, &vg::Paint::color(color));
-            canvas.stroke_path(
-                &path,
-                &vg::Paint::color(vg::Color::rgbaf(0.05, 0.05, 0.05, 0.9))
-                    .with_line_width(1.5 * scale_factor),
-            );
-        }
-    }
-    canvas.reset_scissor();
-}
-
-/// Overlays the threshold curves over the spectrum analyzer. The upwards and downwards curves can
-/// have different shapes as well as different offsets, so both are always drawn.
-fn draw_threshold_curve(
-    cx: &mut DrawContext,
-    canvas: &mut Canvas,
-    analyzer_data: &AnalyzerData,
-    edited_direction: CompressorDirection,
-) {
-    let bounds = cx.bounds();
-
-    let line_width = cx.scale_factor() * 3.0;
-    let downwards_paint = vg::Paint::color(curve_color(
-        DOWNWARDS_THRESHOLD_CURVE_COLOR,
-        edited_direction == CompressorDirection::Downwards,
-    ))
-    .with_line_width(line_width);
-    let upwards_paint = vg::Paint::color(curve_color(
-        UPWARDS_THRESHOLD_CURVE_COLOR,
-        edited_direction == CompressorDirection::Upwards,
-    ))
-    .with_line_width(line_width);
-
-    // This can be done slightly cleverer but for our purposes drawing line segments that are either
-    // 1 pixel apart or that split the curve up into 100 segments (whichever results in the least
-    // amount of line segments) should be sufficient
-    let num_points = 100.min(bounds.w.ceil() as usize);
-
-    let mut draw_curve = |curve_params: &CurveParams,
-                          direction: CompressorDirection,
-                          offset_db: f32,
-                          paint: vg::Paint| {
-        let curve = Curve::new(curve_params);
-        // One shared bank, filtered down to the nodes assigned to this compressor
-        let eq_curve = EqCurve::new(&analyzer_data.eq_params, direction);
-
-        let mut path = vg::Path::new();
-        for i in 0..num_points {
-            let x_t = i as f32 / (num_points - 1) as f32;
-            let ln_freq = LN_FREQ_RANGE_START_HZ + (LN_FREQ_RANGE * x_t);
-
-            // Evaluating the curve results in a value in dB, which must then be mapped to the same
-            // scale used in `draw_spectrum()`. The nodes are evaluated the same way the compressor
-            // bank does it, so the drawn curve matches the audible one.
-            let y_db = curve.evaluate_ln(ln_freq) + eq_curve.evaluate_db(ln_freq.exp()) + offset_db;
-            let y_t = db_to_unclamped_t(y_db);
-
-            let physical_x_pos = bounds.x + (bounds.w * x_t);
-            // This value increases from bottom to top
-            let physical_y_pos = bounds.y + (bounds.h * (1.0 - y_t));
-
-            if i == 0 {
-                path.move_to(physical_x_pos, physical_y_pos);
-            } else {
-                path.line_to(physical_x_pos, physical_y_pos);
-            }
-        }
-
-        // This does a way better job at cutting off the tops and bottoms of the graph than we could do
-        // by hand
-        canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
-        canvas.stroke_path(&path, &paint);
-        canvas.reset_scissor();
+/// These used to arrive through the analyzer's triple buffer, which meant they only refreshed
+/// while `process()` was running. With the transport stopped a host may not call it at all, so
+/// the curve froze at whatever it last saw, or at the default, whose zero center frequency makes
+/// `ln(0)` and turns the whole curve into NaN. Reading the parameters directly keeps the curve
+/// live whether or not audio is flowing.
+fn curve_inputs(
+    params: &SpectralCompressorParams,
+    direction: CompressorDirection,
+) -> (CurveParams, EqCurveParams, f32) {
+    let compressor = match direction {
+        CompressorDirection::Upwards => &params.compressors.upwards,
+        CompressorDirection::Downwards => &params.compressors.downwards,
     };
 
-    let (upwards_offset_db, downwards_offset_db) = analyzer_data.curve_offsets_db;
-    draw_curve(
-        &analyzer_data.upwards_curve_params,
-        CompressorDirection::Upwards,
-        upwards_offset_db,
-        upwards_paint,
-    );
-    draw_curve(
-        &analyzer_data.downwards_curve_params,
-        CompressorDirection::Downwards,
-        downwards_offset_db,
-        downwards_paint,
-    );
+    (
+        params.threshold.curve_params(compressor),
+        params.threshold.eq.snapshot(),
+        compressor.threshold_offset_db.value(),
+    )
 }
 
+/// Overlays the gain reduction display over the spectrum analyzer.
 /// Overlays the gain reduction display over the spectrum analyzer.
 fn draw_gain_reduction(
     cx: &mut DrawContext,

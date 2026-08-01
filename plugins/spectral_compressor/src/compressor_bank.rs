@@ -693,16 +693,6 @@ impl CompressorBank {
         if should_update_analyzer_data && channel_idx == num_channels - 1 {
             let analyzer_input_data = self.analyzer_input_data.input_buffer();
 
-            // The editor needs to know about this too so it can draw the spectra correctly
-            analyzer_input_data.downwards_curve_params =
-                params.threshold.curve_params(&params.compressors.downwards);
-            analyzer_input_data.upwards_curve_params =
-                params.threshold.curve_params(&params.compressors.upwards);
-            analyzer_input_data.eq_params = params.threshold.eq.snapshot();
-            analyzer_input_data.curve_offsets_db = (
-                params.compressors.upwards.threshold_offset_db.value(),
-                params.compressors.downwards.threshold_offset_db.value(),
-            );
             analyzer_input_data.num_bins = num_bins;
 
             // The gain reduction data needs to be averaged, see above

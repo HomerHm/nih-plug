@@ -235,7 +235,7 @@ fn direction_selector(cx: &mut Context) {
             Button::new(
                 cx,
                 move |cx| cx.emit(EditorEvent::SelectDirection(direction)),
-                move |cx| Label::new(cx, direction.name()),
+                move |cx| Label::new(cx, direction.name()).font_size(12.0),
             )
             .checked(Data::edited_direction.map(move |edited| *edited == direction))
             .class("direction-button");
@@ -440,7 +440,7 @@ fn node_inspector(cx: &mut Context) {
                     );
                     cx.emit(EditorEvent::SelectNode(None));
                 },
-                |cx| Label::new(cx, "Delete"),
+                |cx| Label::new(cx, "Delete").font_size(12.0),
             )
             .class("direction-button");
         });
