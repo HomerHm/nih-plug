@@ -922,20 +922,13 @@ impl CompressorBank {
         //       that lag is orders of magnitude shorter than the envelope timings, and avoiding it
         //       would mean a separate analysis pass over every channel.
         for (bin_idx, envelope) in self.envelopes[channel_idx].iter_mut().enumerate() {
-            let magnitude: f32 = self
-                .spectrum_magnitudes
-                .iter()
-                .enumerate()
-                .map(|(other_channel_idx, magnitudes)| {
-                    let t = if other_channel_idx == channel_idx {
-                        this_channel_t
-                    } else {
-                        other_channels_t
-                    };
-
-                    unsafe { magnitudes.get_unchecked(bin_idx) * t }
-                })
-                .sum();
+            let magnitude = linked_magnitude(
+                &self.spectrum_magnitudes,
+                channel_idx,
+                bin_idx,
+                this_channel_t,
+                other_channels_t,
+            );
 
             if *envelope > magnitude {
                 *envelope = (release_old_t * *envelope) + (release_new_t * magnitude);
@@ -1437,6 +1430,35 @@ impl CompressorBank {
     }
 }
 
+/// The level one channel's detector sees, with the other channels folded in.
+///
+/// `this_channel_t` and `other_channels_t` are weights that sum to one across all channels, so at
+/// full linking every channel ends up detecting the average of them all.
+#[inline]
+fn linked_magnitude(
+    magnitudes: &[Vec<f32>],
+    channel_idx: usize,
+    bin_idx: usize,
+    this_channel_t: f32,
+    other_channels_t: f32,
+) -> f32 {
+    magnitudes
+        .iter()
+        .enumerate()
+        .map(|(other_channel_idx, magnitudes)| {
+            let t = if other_channel_idx == channel_idx {
+                this_channel_t
+            } else {
+                other_channels_t
+            };
+
+            // SAFETY: Every channel's magnitudes are resized together with the envelopes this is
+            //         indexed alongside.
+            unsafe { magnitudes.get_unchecked(bin_idx) * t }
+        })
+        .sum()
+}
+
 /// Which chain a channel belongs to.
 ///
 /// The stereo mode decides what the two chains mean; by the time the audio gets here it has
@@ -1529,4 +1551,61 @@ fn upwards_soft_knee_coefficients(threshold_db: f32, knee_width_db: f32, ratio: 
     let intercept = -threshold_db - (knee_width_db / 2.0);
 
     (scale, intercept)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The weights `update_envelopes` derives from the channel link amount.
+    fn weights(link: f32, num_channels: f32) -> (f32, f32) {
+        let other_channels_t = link / num_channels;
+        (
+            1.0 - (other_channels_t * (num_channels - 1.0)),
+            other_channels_t,
+        )
+    }
+
+    #[test]
+    fn unlinked_channels_detect_only_themselves() {
+        let magnitudes = vec![vec![1.0], vec![0.0]];
+        let (this_t, other_t) = weights(0.0, 2.0);
+
+        assert_eq!(
+            linked_magnitude(&magnitudes, 0, 0, this_t, other_t),
+            1.0,
+            "the loud channel should see its own level"
+        );
+        assert_eq!(
+            linked_magnitude(&magnitudes, 1, 0, this_t, other_t),
+            0.0,
+            "the silent channel should not see the loud one"
+        );
+    }
+
+    #[test]
+    fn fully_linked_channels_detect_the_same_level() {
+        let magnitudes = vec![vec![1.0], vec![0.0]];
+        let (this_t, other_t) = weights(1.0, 2.0);
+
+        let left = linked_magnitude(&magnitudes, 0, 0, this_t, other_t);
+        let right = linked_magnitude(&magnitudes, 1, 0, this_t, other_t);
+        assert_eq!(
+            left, right,
+            "fully linked, both channels must detect the same level"
+        );
+        assert_eq!(left, 0.5, "which is the average of the two");
+    }
+
+    #[test]
+    fn partial_linking_lands_between_the_two() {
+        let magnitudes = vec![vec![1.0], vec![0.0]];
+        let (this_t, other_t) = weights(0.5, 2.0);
+
+        let right = linked_magnitude(&magnitudes, 1, 0, this_t, other_t);
+        assert!(
+            right > 0.0 && right < 0.5,
+            "half linked should lift the silent channel part way, got {right}"
+        );
+    }
 }
