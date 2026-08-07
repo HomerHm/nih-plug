@@ -34,3 +34,19 @@ analyzer {
   top: 1s;
   bottom: 1s;
 }
+
+/* The solo buttons. A solo left engaged silently makes everything downstream sound wrong, and it
+   is deliberately not saved with the project, so it is coloured as a warning rather than styled
+   like the neighbouring selectors. */
+.solo-button {
+  background-color: #3c3c3c;
+  border-radius: 3px;
+  child-left: 8px;
+  child-right: 8px;
+  color: #b4b4b4;
+}
+
+.solo-button:checked {
+  background-color: #c8873c;
+  color: #161616;
+}

@@ -16,6 +16,7 @@
 
 use analyzer::AnalyzerData;
 use atomic_float::AtomicF32;
+use crossbeam::atomic::AtomicCell;
 use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
 use realfft::num_complex::Complex32;
@@ -80,6 +81,10 @@ pub struct SpectralCompressor {
     /// The output for the analyzer data computed in `CompressorBank` while the editor is open. This
     /// can be cloned and moved into the editor.
     analyzer_output_data: Arc<Mutex<triple_buffer::Output<AnalyzerData>>>,
+
+    /// Which chain is being soloed, set from the editor. Not part of the parameters, so it is
+    /// never persisted.
+    solo: Arc<AtomicCell<SoloMode>>,
 }
 
 /// An FFT plan for a specific window size, all of which will be precomputed during initilaization.
@@ -110,6 +115,19 @@ pub struct SpectralCompressorParams {
     /// Parameters for the upwards and downwards compressors.
     #[nested(group = "compressors")]
     pub compressors: compressor_bank::CompressorBankParams,
+}
+
+/// Which chain, if any, is being listened to on its own.
+///
+/// This is deliberately not a parameter. Soloing is a way to hear what you are adjusting, not a
+/// setting, and a parameter would be saved with the project: reopening it to a soloed channel with
+/// no memory of why would be worse than not having the feature.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum SoloMode {
+    #[default]
+    Off,
+    First,
+    Second,
 }
 
 /// How the two channels relate to each other.
@@ -204,6 +222,7 @@ impl Default for SpectralCompressor {
             complex_fft_buffer: Vec::with_capacity(MAX_WINDOW_SIZE / 2 + 1),
 
             analyzer_output_data: Arc::new(Mutex::new(analyzer_output_data)),
+            solo: Arc::new(AtomicCell::new(SoloMode::Off)),
         }
     }
 }
@@ -355,7 +374,8 @@ impl Plugin for SpectralCompressor {
                 sample_rate: self.sample_rate.clone(),
 
                 edited_direction: eq_curve::CompressorDirection::Downwards,
-                edited_chain: 0,
+                edited_chain: editor::ChainSelection::Both,
+                solo: self.solo.clone(),
                 selected_node: None,
             },
         )
@@ -535,6 +555,10 @@ impl Plugin for SpectralCompressor {
             convert_mid_side(buffer);
         }
 
+        // Soloing happens last so it applies to what actually leaves the plugin, including the dry
+        // signal. Hearing the dry half of the other channel while soloing would defeat the point.
+        apply_solo(buffer, self.solo.load(), mid_side);
+
         self.dry_wet_mixer.mix_in_dry(
             buffer,
             self.params
@@ -575,6 +599,32 @@ impl SpectralCompressor {
         self.compressor_bank
             .resize(&self.buffer_config, window_size);
         self.compressor_bank.reset();
+    }
+}
+
+/// Mute everything but one chain, so it can be listened to on its own.
+///
+/// In mid/side the chains are not channels, so the buffer is converted, the unwanted half zeroed,
+/// and converted back. Soloing the mid then plays it from both speakers and soloing the side gives
+/// the usual out of phase pair, which is what those are supposed to sound like.
+fn apply_solo(buffer: &mut Buffer, solo: SoloMode, mid_side: bool) {
+    let muted_channel = match solo {
+        SoloMode::Off => return,
+        SoloMode::First => 1,
+        SoloMode::Second => 0,
+    };
+
+    if mid_side {
+        convert_mid_side(buffer);
+    }
+
+    let channels = buffer.as_slice();
+    if let Some(channel) = channels.get_mut(muted_channel) {
+        channel.fill(0.0);
+    }
+
+    if mid_side {
+        convert_mid_side(buffer);
     }
 }
 

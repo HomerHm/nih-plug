@@ -30,15 +30,18 @@ use std::sync::Arc;
 /// the same value: each slider shows the same number, the host records automation for both, and
 /// nothing has to special-case the link when the values are read.
 ///
-/// The widget controlling `link_ptr` must be built inside this view as well, since enabling the
-/// link has to copy values across immediately rather than waiting for the next gesture.
+/// When the link is a parameter, the widget controlling it must be built inside this view as well,
+/// since enabling the link has to copy values across immediately rather than waiting for the next
+/// gesture. A link driven by editor state instead has no parameter to watch, so it passes `None`
+/// and simply starts mirroring from the next edit onwards.
 ///
 /// Only the parameters that are actually paired are affected; everything else passes through.
 pub struct ParamLink<L> {
-    /// Read on every gesture, so toggling the link takes effect immediately.
+    /// Read on every gesture, so toggling the link takes effect immediately. It takes the context
+    /// because a link can be driven by editor state rather than by a parameter.
     is_linked: L,
-    /// The boolean parameter that switches mirroring on and off.
-    link_ptr: ParamPtr,
+    /// The boolean parameter that switches mirroring on and off, if it is one.
+    link_ptr: Option<ParamPtr>,
     /// `(leader, follower)` pairs. Gestures on *either* side are mirrored onto the other, but the
     /// direction matters when the link is switched on: the follower adopts the leader's value.
     pairs: Vec<(ParamPtr, ParamPtr)>,
@@ -50,14 +53,14 @@ pub struct ParamLink<L> {
 
 impl<L> ParamLink<L>
 where
-    L: 'static + Fn() -> bool,
+    L: 'static + Fn(&EventContext) -> bool,
 {
     /// Wrap `content` so that gestures are mirrored between each `(leader, follower)` pair
     /// whenever `is_linked` returns true. `content` must include the widget for `link_ptr`.
     pub fn new(
         cx: &mut Context,
         is_linked: L,
-        link_ptr: ParamPtr,
+        link_ptr: Option<ParamPtr>,
         pairs: Vec<(ParamPtr, ParamPtr)>,
         content: impl FnOnce(&mut Context),
     ) -> Handle<'_, Self> {
@@ -106,7 +109,7 @@ where
 
 impl<L> View for ParamLink<L>
 where
-    L: 'static + Fn() -> bool,
+    L: 'static + Fn(&EventContext) -> bool,
 {
     fn element(&self) -> Option<&'static str> {
         Some("param-link")
@@ -122,7 +125,7 @@ where
                 RawParamEvent::ParametersChanged => return,
             };
 
-            if ptr == self.link_ptr {
+            if Some(ptr) == self.link_ptr {
                 // The parameter itself has not been updated yet at this point, so the new state
                 // has to come from the event rather than from `is_linked`
                 if let RawParamEvent::SetParameterNormalized(_, normalized) = param_event {
@@ -142,7 +145,7 @@ where
                 return;
             }
 
-            if !(self.is_linked)() {
+            if !(self.is_linked)(cx) {
                 return;
             }
             let Some(counterpart) = self.counterpart(ptr) else {

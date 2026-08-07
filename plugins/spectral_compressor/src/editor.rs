@@ -26,8 +26,9 @@ use self::param_link::{param_ptr_by_id, param_ptr_pairs, ParamLink};
 use crate::analyzer::AnalyzerData;
 use crate::compressor_bank::{ThresholdCurveParams, NUM_CHAINS};
 use crate::eq_curve::{CompressorDirection, EqNodeParams, EqNodeType, MAX_EQ_NODES};
-use crate::StereoMode;
+use crate::{SoloMode, StereoMode};
 use crate::{SpectralCompressor, SpectralCompressorParams};
+use crossbeam::atomic::AtomicCell;
 
 mod analyzer;
 mod param_link;
@@ -80,10 +81,57 @@ impl nih_plug_vizia::vizia::prelude::Data for CompressorDirection {
     }
 }
 
+/// Which chain (or chains) the editor is working on.
+///
+/// `Both` is the default, so out of the box an edit reaches both chains and they stay identical.
+/// The two are only allowed to drift apart once one of them is picked deliberately. The order
+/// matches how the chains sit in the stereo field rather than putting the shared option first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainSelection {
+    First,
+    Both,
+    Second,
+}
+
+impl nih_plug_vizia::vizia::prelude::Data for ChainSelection {
+    fn same(&self, other: &Self) -> bool {
+        self == other
+    }
+}
+
+impl ChainSelection {
+    /// The chain whose values are shown and directly edited. In `Both` the edits are mirrored onto
+    /// the other one, so it doesn't matter which of the two this is.
+    pub fn primary(self) -> usize {
+        match self {
+            ChainSelection::Second => 1,
+            _ => 0,
+        }
+    }
+
+    /// Whether edits should be mirrored onto the other chain.
+    fn mirrors(self) -> bool {
+        self == ChainSelection::Both
+    }
+
+    /// This option's label for the given stereo mode. `Both` reads the same either way.
+    fn name(self, stereo_mode: &StereoMode) -> &'static str {
+        match (self, stereo_mode) {
+            (ChainSelection::Both, _) => "Both",
+            (ChainSelection::First, StereoMode::MidSide) => "Mid",
+            (ChainSelection::Second, StereoMode::MidSide) => "Side",
+            (ChainSelection::First, _) => "Left",
+            (ChainSelection::Second, _) => "Right",
+        }
+    }
+}
+
 /// Events the editor handles itself, rather than passing on to the parameters.
 pub enum EditorEvent {
-    /// Switch which chain the analyzer edits.
-    SelectChain(usize),
+    /// Switch which chain, or chains, the analyzer edits.
+    SelectChain(ChainSelection),
+    /// Listen to one chain on its own. Momentary, and deliberately not a parameter.
+    SetSolo(SoloMode),
     /// Switch which curve within that chain the analyzer edits.
     SelectDirection(CompressorDirection),
     /// Select a node in the current chain for the inspector below the analyzer, or clear it.
@@ -101,8 +149,11 @@ pub struct Data {
     /// Which curve the analyzer edits. Editor state rather than a parameter, since it changes
     /// nothing about the sound.
     pub(crate) edited_direction: CompressorDirection,
-    /// Which chain the analyzer edits. What it means depends on the stereo mode.
-    pub(crate) edited_chain: usize,
+    /// Which chain, or chains, the analyzer edits. What they mean depends on the stereo mode.
+    pub(crate) edited_chain: ChainSelection,
+    /// Which chain is being listened to on its own, shared with the audio thread. Not a parameter,
+    /// so it is never saved with a project: leaving a solo engaged should not outlive the session.
+    pub(crate) solo: Arc<AtomicCell<SoloMode>>,
     /// The node the inspector below the analyzer is editing, as `(chain, node)`. The chain is part
     /// of it because a node index only means something within one chain's bank.
     pub(crate) selected_node: Option<(usize, usize)>,
@@ -111,13 +162,14 @@ pub struct Data {
 impl Model for Data {
     fn event(&mut self, _cx: &mut EventContext, event: &mut Event) {
         event.map(|editor_event, _| match editor_event {
-            EditorEvent::SelectChain(chain_idx) => {
-                self.edited_chain = *chain_idx;
+            EditorEvent::SelectChain(selection) => {
+                self.edited_chain = *selection;
                 self.selected_node = None;
             }
+            EditorEvent::SetSolo(solo) => self.solo.store(*solo),
             EditorEvent::SelectDirection(direction) => self.edited_direction = *direction,
             EditorEvent::SelectNode(node_index) => {
-                self.selected_node = node_index.map(|index| (self.edited_chain, index));
+                self.selected_node = node_index.map(|index| (self.edited_chain.primary(), index));
             }
         });
     }
@@ -179,12 +231,32 @@ fn param_links(cx: &mut Context, content: impl FnOnce(&mut Context)) {
     let curve_link_ptr = param_ptr_by_id(&params.threshold, "thresh_link");
     let curve_linked = {
         let params = params.clone();
-        move || params.threshold.slope_curve_link.value()
+        move |_: &EventContext| params.threshold.slope_curve_link.value()
     };
 
-    ParamLink::new(cx, curve_linked, curve_link_ptr, curve_pairs, content)
-        .width(Stretch(1.0))
-        .height(Stretch(1.0));
+    // Pairing by ID covers everything a chain holds, so a parameter added to one later cannot
+    // quietly stay unmirrored
+    let chain_pairs = param_ptr_pairs(&params.threshold.chains[0], &params.threshold.chains[1]);
+    // There is no link parameter here: which chains an edit reaches is editor state, so switching
+    // to `Both` deliberately overwrites nothing. The two converge the moment something is touched.
+    let chains_mirrored = |cx: &EventContext| {
+        cx.data::<Data>()
+            .is_some_and(|data| data.edited_chain.mirrors())
+    };
+
+    ParamLink::new(
+        cx,
+        curve_linked,
+        Some(curve_link_ptr),
+        curve_pairs,
+        move |cx| {
+            ParamLink::new(cx, chains_mirrored, None, chain_pairs, content)
+                .width(Stretch(1.0))
+                .height(Stretch(1.0));
+        },
+    )
+    .width(Stretch(1.0))
+    .height(Stretch(1.0));
 }
 
 fn title_bar(cx: &mut Context) {
@@ -226,7 +298,7 @@ fn analyzer(cx: &mut Context) {
             Data::params,
             Data::edited_direction,
             Data::selected_node,
-            Data::edited_chain,
+            Data::edited_chain.map(|edited| edited.primary()),
         )
         // Soaks up all vertical space the controls below don't need
         .height(Stretch(1.0));
@@ -246,31 +318,30 @@ fn analyzer(cx: &mut Context) {
 /// picked here.
 fn direction_selector(cx: &mut Context) {
     HStack::new(cx, |cx| {
-        for chain_idx in 0..NUM_CHAINS {
+        for selection in [
+            ChainSelection::First,
+            ChainSelection::Both,
+            ChainSelection::Second,
+        ] {
             Button::new(
                 cx,
-                move |cx| cx.emit(EditorEvent::SelectChain(chain_idx)),
+                move |cx| cx.emit(EditorEvent::SelectChain(selection)),
                 move |cx| {
-                    // The chains are only left/right or mid/side depending on the stereo mode, so
-                    // the label follows it rather than being fixed
+                    // A chain is only left/right or mid/side depending on the stereo mode, so the
+                    // label follows it rather than being fixed
                     Label::new(
                         cx,
-                        Data::params.map(move |p| {
-                            match (p.global.stereo_mode.value(), chain_idx) {
-                                (StereoMode::MidSide, 0) => "Mid",
-                                (StereoMode::MidSide, _) => "Side",
-                                (_, 0) => "Left",
-                                (_, _) => "Right",
-                            }
-                        }),
+                        Data::params.map(move |p| selection.name(&p.global.stereo_mode.value())),
                     )
                     .font_size(12.0)
                 },
             )
-            .checked(Data::edited_chain.map(move |edited| *edited == chain_idx))
+            .checked(Data::edited_chain.map(move |edited| *edited == selection))
             .class("direction-button");
         }
 
+        Element::new(cx).width(Pixels(12.0));
+        solo_buttons(cx);
         Element::new(cx).width(Pixels(16.0));
 
         for direction in [CompressorDirection::Upwards, CompressorDirection::Downwards] {
@@ -286,6 +357,31 @@ fn direction_selector(cx: &mut Context) {
     .height(Pixels(22.0))
     .col_between(Pixels(4.0))
     .bottom(Pixels(4.0));
+}
+
+/// The buttons for listening to one chain on its own.
+///
+/// Clicking the engaged one releases it. These are styled as a warning because a solo left engaged
+/// is a silent way to make everything downstream sound wrong.
+fn solo_buttons(cx: &mut Context) {
+    for (solo, label) in [(SoloMode::First, "S1"), (SoloMode::Second, "S2")] {
+        Button::new(
+            cx,
+            move |cx| {
+                let engaged = cx
+                    .data::<Data>()
+                    .is_some_and(|data| data.solo.load() == solo);
+                cx.emit(EditorEvent::SetSolo(if engaged {
+                    SoloMode::Off
+                } else {
+                    solo
+                }));
+            },
+            move |cx| Label::new(cx, label).font_size(12.0),
+        )
+        .checked(Data::solo.map(move |current| current.load() == solo))
+        .class("solo-button");
+    }
 }
 
 /// The frequency labels underneath the analyzer.
@@ -393,7 +489,7 @@ fn compressor_column(cx: &mut Context, direction: CompressorDirection) {
                 });
             })
             .height(Auto)
-            .display(Data::edited_chain.map(move |edited| *edited == chain_idx));
+            .display(Data::edited_chain.map(move |edited| edited.primary() == chain_idx));
         }
 
         // We don't want to show the 'Upwards'/'Downwards' prefix here, but it should still be in
