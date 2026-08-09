@@ -104,12 +104,10 @@ const UNSELECTED_CURVE_OPACITY: f32 = 0.3;
 /// backgrounds.
 const GR_BAR_OVERLAY_COLOR: vg::Color = vg::Color::rgbaf(0.85, 0.95, 1.0, 0.8);
 
-/// The color used for drawing the downwards compression threshold curve. Looks somewhat similar to
-/// `GR_BAR_OVERLAY_COLOR` when factoring in the blending.
-const DOWNWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.45, 0.55, 0.6, 0.9);
-/// The color used for drawing the upwards compression threshold curve. Slightly color to make to
-/// make the output look less confusing.
-const UPWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.55, 0.70, 0.65, 0.9);
+/// Downwards compression attenuates, so it gets the warmer of the two colors.
+const DOWNWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.82, 0.34, 0.32, 0.9);
+/// Upwards compression lifts, so it gets the cooler one.
+const UPWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.25, 0.50, 0.82, 0.9);
 
 /// A very analyzer showing the envelope followers as a magnitude spectrum with an overlay for the
 /// gain reduction.
@@ -484,10 +482,10 @@ where
         let nyquist = self.sample_rate.load(Ordering::Relaxed) / 2.0;
 
         draw_grid(cx, canvas);
-        draw_spectrum(cx, canvas, analyzer_data, nyquist);
+        draw_spectrum(cx, canvas, analyzer_data, nyquist, chain_idx);
         self.draw_threshold_curves(cx, canvas, chain_idx, edited_direction);
         self.draw_nodes(cx, canvas, chain_idx, edited_direction, selected_node);
-        draw_gain_reduction(cx, canvas, analyzer_data, nyquist);
+        draw_gain_reduction(cx, canvas, analyzer_data, nyquist, chain_idx);
 
         // Draw the border last
         let border_width = cx.border_width();
@@ -677,6 +675,7 @@ fn draw_spectrum(
     canvas: &mut Canvas,
     analyzer_data: &AnalyzerData,
     nyquist_hz: f32,
+    chain_idx: usize,
 ) {
     let bounds = cx.bounds();
 
@@ -712,8 +711,7 @@ fn draw_spectrum(
     let mut previous_physical_x_coord = bounds.x - 2.0;
 
     let mut bars_path = vg::Path::new();
-    for (bin_idx, magnitude) in analyzer_data
-        .envelope_followers
+    for (bin_idx, magnitude) in analyzer_data.envelope_followers[chain_idx]
         .iter()
         .enumerate()
         .take(analyzer_data.num_bins)
@@ -751,8 +749,7 @@ fn draw_spectrum(
     let mesh_start_y_coordinate = bounds.y + bounds.h;
 
     mesh_path.move_to(mesh_start_x_coordiante, mesh_start_y_coordinate);
-    for (bin_idx, magnitude) in analyzer_data
-        .envelope_followers
+    for (bin_idx, magnitude) in analyzer_data.envelope_followers[chain_idx]
         .iter()
         .enumerate()
         .take(analyzer_data.num_bins)
@@ -891,6 +888,7 @@ fn draw_gain_reduction(
     canvas: &mut Canvas,
     analyzer_data: &AnalyzerData,
     nyquist_hz: f32,
+    chain_idx: usize,
 ) {
     let bounds = cx.bounds();
 
@@ -900,8 +898,7 @@ fn draw_gain_reduction(
     let bin_frequency = |bin_idx: f32| (bin_idx / analyzer_data.num_bins as f32) * nyquist_hz;
 
     let mut path = vg::Path::new();
-    for (bin_idx, gain_difference_db) in analyzer_data
-        .gain_difference_db
+    for (bin_idx, gain_difference_db) in analyzer_data.gain_difference_db[chain_idx]
         .iter()
         .enumerate()
         .take(analyzer_data.num_bins)

@@ -766,11 +766,15 @@ impl CompressorBank {
         let num_channels = self.sidechain_spectrum_magnitudes.len();
         let should_update_analyzer_data = params.editor_state.is_open();
         if should_update_analyzer_data && channel_idx == 0 {
-            // NOTE: This may briefly show a huge amount of accumulated data when the editor has
-            //       just been opened. If this doesn't look too obvious or too jarring this is
-            //       probably worth letting it be like this.
+            // A mono layout only feeds the first chain, so the second would otherwise keep showing
+            // whatever it last held
             let analyzer_input_data = self.analyzer_input_data.input_buffer();
-            analyzer_input_data.gain_difference_db[..num_bins].fill(0.0);
+            for chain in analyzer_input_data.gain_difference_db.iter_mut() {
+                chain[..num_bins].fill(0.0);
+            }
+            for chain in analyzer_input_data.envelope_followers.iter_mut() {
+                chain[..num_bins].fill(0.0);
+            }
         }
 
         self.update_if_needed(params);
@@ -798,32 +802,6 @@ impl CompressorBank {
             let analyzer_input_data = self.analyzer_input_data.input_buffer();
 
             analyzer_input_data.num_bins = num_bins;
-
-            // The gain reduction data needs to be averaged, see above
-            let channel_multiplier = (num_channels as f32).recip();
-            for gain_difference_db in &mut analyzer_input_data.gain_difference_db[..num_bins] {
-                *gain_difference_db *= channel_multiplier;
-            }
-
-            // The spectrum analyzer data has not yet been added
-            assert!(self.envelopes.len() == num_channels);
-            assert!(self.envelopes[0].len() >= num_bins);
-            for (bin_idx, spectrum_data) in analyzer_input_data.envelope_followers[..num_bins]
-                .iter_mut()
-                .enumerate()
-            {
-                *spectrum_data = 0.0;
-                for channel_idx in 0..num_channels {
-                    // SAFETY: These bounds are already checked
-                    *spectrum_data += unsafe {
-                        self.envelopes
-                            .get_unchecked(channel_idx)
-                            .get_unchecked(bin_idx)
-                    };
-                }
-
-                *spectrum_data *= channel_multiplier;
-            }
 
             // After filling the object with data it can be sent to the editor. This happens
             // automatically when using the `.write()` interface, but since `AnalyzerData` contains
@@ -1117,7 +1095,12 @@ impl CompressorBank {
             unsafe {
                 *analyzer_input_data
                     .gain_difference_db
-                    .get_unchecked_mut(bin_idx) += gain_difference_db;
+                    .get_unchecked_mut(chain_idx)
+                    .get_unchecked_mut(bin_idx) = gain_difference_db;
+                *analyzer_input_data
+                    .envelope_followers
+                    .get_unchecked_mut(chain_idx)
+                    .get_unchecked_mut(bin_idx) = *envelope;
             }
 
             *bin *= util::db_to_gain_fast(gain_difference_db);
@@ -1240,7 +1223,12 @@ impl CompressorBank {
             unsafe {
                 *analyzer_input_data
                     .gain_difference_db
-                    .get_unchecked_mut(bin_idx) += gain_difference_db;
+                    .get_unchecked_mut(chain_idx)
+                    .get_unchecked_mut(bin_idx) = gain_difference_db;
+                *analyzer_input_data
+                    .envelope_followers
+                    .get_unchecked_mut(chain_idx)
+                    .get_unchecked_mut(bin_idx) = *envelope;
             }
 
             *bin *= util::db_to_gain_fast(gain_difference_db);

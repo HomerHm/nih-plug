@@ -36,12 +36,15 @@ pub struct AnalyzerData {
     /// includes the DC offset bin which we don't draw, just to make this a bit less confusing.
     ///
     /// This data is taken directly from the envelope followers, so it has the same rise and fall
-    /// time as what is used by the compressors.
-    pub envelope_followers: [f32; crate::MAX_WINDOW_SIZE / 2 + 1],
+    /// time as what is used by the compressors. It is kept per chain because the chains carry
+    /// different signals, so averaging them would draw a spectrum belonging to neither.
+    pub envelope_followers:
+        [[f32; crate::MAX_WINDOW_SIZE / 2 + 1]; crate::compressor_bank::NUM_CHAINS],
     /// The gain different applied to each band, in decibels. Alternatively, the negative gain
     /// reduction. Positive values mean that a band becomes louder, and negative values mean a band
     /// got attenuated. Does not (and should not) factor in the output gain.
-    pub gain_difference_db: [f32; crate::MAX_WINDOW_SIZE / 2 + 1],
+    pub gain_difference_db:
+        [[f32; crate::MAX_WINDOW_SIZE / 2 + 1]; crate::compressor_bank::NUM_CHAINS],
     // TODO: Include the threshold curve. Decide on whether to only visualizer the 'global'
     //       threshold curve or to also show the individual upwards/downwards thresholds. Or omit
     //       this and implement it in a nicer way for the premium Spectral Compressor.
@@ -51,8 +54,10 @@ impl Default for AnalyzerData {
     fn default() -> Self {
         Self {
             num_bins: 0,
-            envelope_followers: [0.0; crate::MAX_WINDOW_SIZE / 2 + 1],
-            gain_difference_db: [0.0; crate::MAX_WINDOW_SIZE / 2 + 1],
+            envelope_followers: [[0.0; crate::MAX_WINDOW_SIZE / 2 + 1];
+                crate::compressor_bank::NUM_CHAINS],
+            gain_difference_db: [[0.0; crate::MAX_WINDOW_SIZE / 2 + 1];
+                crate::compressor_bank::NUM_CHAINS],
         }
     }
 }
