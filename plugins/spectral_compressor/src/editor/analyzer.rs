@@ -206,7 +206,6 @@ where
             let (curve_params, eq_params, offset_db) =
                 curve_inputs(&self.params, chain_idx, direction);
             let curve = Curve::new(&curve_params);
-            let eq_curve = EqCurve::new(&eq_params, direction, chain_idx);
 
             for (index, node) in eq_params.nodes.iter().enumerate() {
                 if node.node_type == EqNodeType::Off
@@ -217,7 +216,7 @@ where
                 }
 
                 let y_db = curve.evaluate_ln(node.center_frequency.ln())
-                    + eq_curve.evaluate_db(node.center_frequency)
+                    + node.handle_offset_db()
                     + offset_db;
 
                 positions.push((
@@ -418,9 +417,22 @@ where
             WindowEvent::MouseDoubleClick(MouseButton::Left) => {
                 let (x, y) = (cx.mouse().cursorx, cx.mouse().cursory);
 
-                // Double clicking a handle does nothing. Removing one is a button in the inspector
-                // below the graph, which leaves double click free to always mean "create".
-                if self.node_at(cx, chain_idx, x, y).is_some() {
+                // Double clicking a handle removes it. There is no ambiguity with creating one:
+                // the hit test already tells a handle apart from empty space.
+                if let Some((node_index, _)) = self.node_at(cx, chain_idx, x, y) {
+                    let node = &self.nodes().nodes[node_index];
+                    set_param(
+                        cx,
+                        node.node_type.as_ptr(),
+                        EqNodeType::Off.to_index() as f32,
+                    );
+
+                    // The first click of this double click started a drag and selected the node
+                    self.drag = None;
+                    cx.emit(EditorEvent::SelectNode(None));
+                    cx.release();
+                    cx.set_active(false);
+                    meta.consume();
                     return;
                 }
 
@@ -441,11 +453,11 @@ where
                 set_param(cx, node.gain_db.as_ptr(), 0.0);
                 // Deleting a node only switches its type off, so a reused slot would otherwise
                 // inherit whatever target it had before
-                let target = match direction {
-                    CompressorDirection::Upwards => EqNodeTarget::Upwards,
-                    CompressorDirection::Downwards => EqNodeTarget::Downwards,
-                };
-                set_param(cx, node.target.as_ptr(), target.to_index() as f32);
+                set_param(
+                    cx,
+                    node.target.as_ptr(),
+                    EqNodeTarget::Both.to_index() as f32,
+                );
                 set_param(
                     cx,
                     node.channel.as_ptr(),

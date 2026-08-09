@@ -210,6 +210,26 @@ impl Default for EqNode {
     }
 }
 
+impl EqNode {
+    /// How far this node's handle sits from the curve it deforms, in decibels.
+    ///
+    /// This is the node's own gain rather than its response, because a notch nulls completely and
+    /// following the response there would put its handle hundreds of decibels below the graph. The
+    /// shapes without a gain get a handle on the curve itself, which is where an EQ usually puts
+    /// them: the handle marks the corner, and the response falls away from it.
+    ///
+    /// Other nodes are deliberately not taken into account, so two overlapping nodes don't drag
+    /// each other's handles around.
+    pub fn handle_offset_db(&self) -> f32 {
+        match self.node_type {
+            EqNodeType::Bell => self.gain_db,
+            // A shelf reaches half its gain at the corner frequency
+            EqNodeType::LowShelf | EqNodeType::HighShelf => self.gain_db / 2.0,
+            _ => 0.0,
+        }
+    }
+}
+
 /// A snapshot of a whole bank of nodes.
 #[derive(Debug, Clone, Copy)]
 pub struct EqCurveParams {
