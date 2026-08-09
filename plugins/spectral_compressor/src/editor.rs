@@ -25,7 +25,7 @@ use self::analyzer::{format_frequency, frequency_to_t, Analyzer, FREQUENCY_TICKS
 use self::param_link::{param_ptr_by_id, param_ptr_pairs, ParamLink};
 use crate::analyzer::AnalyzerData;
 use crate::compressor_bank::{ThresholdCurveParams, NUM_CHAINS};
-use crate::eq_curve::{CompressorDirection, EqNodeParams, EqNodeType, MAX_EQ_NODES};
+use crate::eq_curve::{CompressorDirection, EqNodeChannel, EqNodeParams, EqNodeType, MAX_EQ_NODES};
 use crate::{SoloMode, StereoMode};
 use crate::{SpectralCompressor, SpectralCompressorParams};
 use crossbeam::atomic::AtomicCell;
@@ -112,6 +112,16 @@ impl ChainSelection {
     /// Whether edits should be mirrored onto the other chain.
     fn mirrors(self) -> bool {
         self == ChainSelection::Both
+    }
+
+    /// The channel a node created under this selection belongs to. Creating one while a single
+    /// chain is picked gives it to that chain rather than to both.
+    fn new_node_channel(self) -> EqNodeChannel {
+        match self {
+            ChainSelection::First => EqNodeChannel::First,
+            ChainSelection::Both => EqNodeChannel::Both,
+            ChainSelection::Second => EqNodeChannel::Second,
+        }
     }
 
     /// This option's label for the given stereo mode. `Both` reads the same either way.
@@ -234,8 +244,8 @@ fn param_links(cx: &mut Context, content: impl FnOnce(&mut Context)) {
         move |_: &EventContext| params.threshold.slope_curve_link.value()
     };
 
-    // Pairing by ID covers everything a chain holds, so a parameter added to one later cannot
-    // quietly stay unmirrored
+    // Only the curve shapes are paired. The nodes are one shared bank now, each carrying which
+    // chain it belongs to, so mirroring them would be duplicating a node onto itself.
     let chain_pairs = param_ptr_pairs(&params.threshold.chains[0], &params.threshold.chains[1]);
     // There is no link parameter here: which chains an edit reaches is editor state, so switching
     // to `Both` deliberately overwrites nothing. The two converge the moment something is touched.
@@ -299,6 +309,7 @@ fn analyzer(cx: &mut Context) {
             Data::edited_direction,
             Data::selected_node,
             Data::edited_chain.map(|edited| edited.primary()),
+            Data::edited_chain.map(|edited| edited.new_node_channel()),
         )
         // Soaks up all vertical space the controls below don't need
         .height(Stretch(1.0));
@@ -594,28 +605,23 @@ fn node_inspector(cx: &mut Context) {
                         .bottom(Stretch(1.0));
 
                     let params = Data::params;
+                    ParamSlider::new(cx, params, move |p| &p.threshold.eq.nodes[index].node_type)
+                        .set_style(ParamSliderStyle::FromLeft)
+                        .width(Pixels(150.0));
+                    ParamSlider::new(cx, params, move |p| &p.threshold.eq.nodes[index].target)
+                        .set_style(ParamSliderStyle::FromLeft)
+                        .width(Pixels(110.0));
+                    ParamSlider::new(cx, params, move |p| &p.threshold.eq.nodes[index].channel)
+                        .set_style(ParamSliderStyle::FromLeft)
+                        .width(Pixels(110.0));
                     ParamSlider::new(cx, params, move |p| {
-                        &p.threshold.chains[chain_idx].eq.nodes[index].node_type
-                    })
-                    .set_style(ParamSliderStyle::FromLeft)
-                    .width(Pixels(150.0));
-                    ParamSlider::new(cx, params, move |p| {
-                        &p.threshold.chains[chain_idx].eq.nodes[index].target
-                    })
-                    .set_style(ParamSliderStyle::FromLeft)
-                    .width(Pixels(120.0));
-                    ParamSlider::new(cx, params, move |p| {
-                        &p.threshold.chains[chain_idx].eq.nodes[index].center_frequency
-                    })
-                    .width(Pixels(110.0));
-                    ParamSlider::new(cx, params, move |p| {
-                        &p.threshold.chains[chain_idx].eq.nodes[index].gain_db
+                        &p.threshold.eq.nodes[index].center_frequency
                     })
                     .width(Pixels(110.0));
-                    ParamSlider::new(cx, params, move |p| {
-                        &p.threshold.chains[chain_idx].eq.nodes[index].q
-                    })
-                    .width(Pixels(90.0));
+                    ParamSlider::new(cx, params, move |p| &p.threshold.eq.nodes[index].gain_db)
+                        .width(Pixels(110.0));
+                    ParamSlider::new(cx, params, move |p| &p.threshold.eq.nodes[index].q)
+                        .width(Pixels(90.0));
 
                     Button::new(
                         cx,
@@ -667,7 +673,7 @@ fn set_node_variant(
     let Some(data) = cx.data::<Data>() else {
         return;
     };
-    let ptr = param_ptr(&data.params.threshold.chains[chain_idx].eq.nodes[node_index]);
+    let ptr = param_ptr(&data.params.threshold.eq.nodes[node_index]);
 
     // An enum parameter's normalized range is divided evenly between its variants
     let normalized = index as f32 / (variant_count.saturating_sub(1).max(1)) as f32;

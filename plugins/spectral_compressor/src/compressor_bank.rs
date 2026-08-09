@@ -154,6 +154,13 @@ pub struct ThresholdParams {
     /// The two processing chains. Which audio ends up in which depends on the stereo mode.
     #[nested(array, group = "Chain")]
     pub chains: [ChainParams; NUM_CHAINS],
+
+    /// EQ-shaped nodes deforming the threshold curves. One bank is shared by both compressors and
+    /// both chains, with each node carrying which of them it applies to. Giving each chain its own
+    /// bank instead meant a node meant for both was really two nodes that started out identical,
+    /// so editing one silently left the other behind.
+    #[nested(group = "Threshold EQ")]
+    pub eq: EqBankParams,
 }
 
 /// The type of threshold to use.
@@ -232,10 +239,6 @@ pub struct ChainParams {
     pub upwards: ThresholdCurveParams,
     #[nested(id_prefix = "downwards", group = "Downwards")]
     pub downwards: ThresholdCurveParams,
-    /// EQ-shaped nodes deforming this chain's threshold curves. Each node picks which compressors
-    /// within the chain it applies to.
-    #[nested(group = "Threshold EQ")]
-    pub eq: EqBankParams,
 }
 
 /// This struct contains the parameters for either the upward or downward compressors. The `Params`
@@ -331,7 +334,6 @@ impl ChainParams {
         chain_idx: usize,
         set_update_downwards_thresholds: Arc<dyn Fn(f32) + Send + Sync>,
         set_update_upwards_thresholds: Arc<dyn Fn(f32) + Send + Sync>,
-        set_update_both_thresholds: Arc<dyn Fn(f32) + Send + Sync>,
     ) -> Self {
         // The chains are named neutrally because what they mean depends on the stereo mode; the
         // editor labels them Left/Right or Mid/Side to match
@@ -346,7 +348,6 @@ impl ChainParams {
                 &format!("{name_prefix} {DOWNWARDS_NAME_PREFIX}"),
                 set_update_downwards_thresholds,
             ),
-            eq: EqBankParams::new(&format!("{name_prefix} "), set_update_both_thresholds),
         }
     }
 }
@@ -431,9 +432,9 @@ impl ThresholdParams {
                     chain_idx,
                     set_update_downwards_thresholds.clone(),
                     set_update_upwards_thresholds.clone(),
-                    set_update_both_thresholds_for_chains.clone(),
                 )
             }),
+            eq: EqBankParams::new("", set_update_both_thresholds_for_chains),
         }
     }
 
@@ -1260,10 +1261,11 @@ impl CompressorBank {
         curve_params: &CurveParams,
         eq_params: &EqCurveParams,
         direction: CompressorDirection,
+        chain_idx: usize,
         intercept_db: f32,
     ) {
         let curve = Curve::new(curve_params);
-        let eq_curve = EqCurve::new(eq_params, direction);
+        let eq_curve = EqCurve::new(eq_params, direction, chain_idx);
 
         // Skipping the scratch buffer entirely when every node is off keeps the common case as
         // cheap as it was before the nodes existed
@@ -1305,8 +1307,9 @@ impl CompressorBank {
                     &mut self.eq_power,
                     &mut self.downwards_thresholds_db[chain_idx],
                     &params.threshold.curve_params(&chain.downwards),
-                    &chain.eq.snapshot(),
+                    &params.threshold.eq.snapshot(),
                     CompressorDirection::Downwards,
+                    chain_idx,
                     chain.downwards.threshold_offset_db.value(),
                 );
             }
@@ -1324,8 +1327,9 @@ impl CompressorBank {
                     &mut self.eq_power,
                     &mut self.upwards_thresholds_db[chain_idx],
                     &params.threshold.curve_params(&chain.upwards),
-                    &chain.eq.snapshot(),
+                    &params.threshold.eq.snapshot(),
                     CompressorDirection::Upwards,
+                    chain_idx,
                     chain.upwards.threshold_offset_db.value(),
                 );
             }

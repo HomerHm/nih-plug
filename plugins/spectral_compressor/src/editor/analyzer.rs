@@ -25,7 +25,9 @@ use super::EditorEvent;
 use crate::analyzer::AnalyzerData;
 use crate::curve::{Curve, CurveParams};
 use crate::eq_curve::CompressorDirection;
-use crate::eq_curve::{EqBankParams, EqCurve, EqCurveParams, EqNodeTarget, EqNodeType};
+use crate::eq_curve::{
+    EqBankParams, EqCurve, EqCurveParams, EqNodeChannel, EqNodeTarget, EqNodeType,
+};
 use crate::SpectralCompressorParams;
 use nih_plug::prelude::{Enum, Param, ParamPtr};
 use nih_plug_vizia::widgets::RawParamEvent;
@@ -111,7 +113,7 @@ const UPWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.55, 0.70, 0.
 
 /// A very analyzer showing the envelope followers as a magnitude spectrum with an overlay for the
 /// gain reduction.
-pub struct Analyzer<L, LSelected, LChain> {
+pub struct Analyzer<L, LSelected, LChain, LNewChannel> {
     analyzer_data: Arc<Mutex<triple_buffer::Output<AnalyzerData>>>,
     sample_rate: Arc<AtomicF32>,
     /// Which compressor's curve the mouse acts on. Read during both drawing and event handling,
@@ -125,6 +127,8 @@ pub struct Analyzer<L, LSelected, LChain> {
     selected_node: LSelected,
     /// Which chain the mouse acts on, alongside `edited_direction`.
     edited_chain: LChain,
+    /// The channel a newly created node is given.
+    new_node_channel: LNewChannel,
 }
 
 /// A node handle being dragged.
@@ -140,11 +144,12 @@ struct NodeDrag {
     start_cursor: (f32, f32),
 }
 
-impl<L, LSelected, LChain> Analyzer<L, LSelected, LChain>
+impl<L, LSelected, LChain, LNewChannel> Analyzer<L, LSelected, LChain, LNewChannel>
 where
     L: Lens<Target = CompressorDirection>,
     LSelected: Lens<Target = Option<(usize, usize)>>,
     LChain: Lens<Target = usize>,
+    LNewChannel: Lens<Target = EqNodeChannel>,
 {
     /// Creates a new [`Analyzer`].
     pub fn new<LAnalyzerData, LRate, LParams>(
@@ -155,12 +160,14 @@ where
         edited_direction: L,
         selected_node: LSelected,
         edited_chain: LChain,
+        new_node_channel: LNewChannel,
     ) -> Handle<'_, Self>
     where
         LAnalyzerData: Lens<Target = Arc<Mutex<triple_buffer::Output<AnalyzerData>>>>,
         LRate: Lens<Target = Arc<AtomicF32>>,
         LParams: Lens<Target = Arc<SpectralCompressorParams>>,
         LChain: Lens<Target = usize>,
+        LNewChannel: Lens<Target = EqNodeChannel>,
     {
         Self {
             analyzer_data: analyzer_data.get(cx),
@@ -170,6 +177,7 @@ where
             drag: None,
             selected_node,
             edited_chain,
+            new_node_channel,
         }
         .build(
             cx,
@@ -178,10 +186,10 @@ where
         )
     }
 
-    /// The edited chain's bank of nodes. Which curve within it a node deforms is that node's own
-    /// `target` parameter.
-    fn nodes(&self, chain_idx: usize) -> &EqBankParams {
-        &self.params.threshold.chains[chain_idx].eq
+    /// The shared bank of nodes. Which curves a node deforms are its own `target` and `channel`
+    /// parameters.
+    fn nodes(&self) -> &EqBankParams {
+        &self.params.threshold.eq
     }
 
     /// Where a node's handle is drawn, as `[0, 1]` fractions of the analyzer's bounds. Mirrors
@@ -197,7 +205,7 @@ where
     ) -> Vec<(usize, f32, f32)> {
         let (curve_params, eq_params, offset_db) = curve_inputs(&self.params, chain_idx, direction);
         let curve = Curve::new(&curve_params);
-        let eq_curve = EqCurve::new(&eq_params, direction);
+        let eq_curve = EqCurve::new(&eq_params, direction, chain_idx);
 
         // Only nodes that deform this curve get a handle on it, so a node assigned to the other
         // compressor can't be grabbed here
@@ -206,7 +214,9 @@ where
             .iter()
             .enumerate()
             .filter(|(_, node)| {
-                node.node_type != EqNodeType::Off && node.target.applies_to(direction)
+                node.node_type != EqNodeType::Off
+                    && node.target.applies_to(direction)
+                    && node.channel.applies_to(chain_idx)
             })
             .map(|(index, node)| {
                 let y_db = curve.evaluate_ln(node.center_frequency.ln())
@@ -223,8 +233,8 @@ where
     }
 
     /// The parameters a drag moves: the node's frequency and its gain.
-    fn drag_param_ptrs(&self, chain_idx: usize, node_index: usize) -> (ParamPtr, ParamPtr) {
-        let node = &self.nodes(chain_idx).nodes[node_index];
+    fn drag_param_ptrs(&self, node_index: usize) -> (ParamPtr, ParamPtr) {
+        let node = &self.nodes().nodes[node_index];
 
         (node.center_frequency.as_ptr(), node.gain_db.as_ptr())
     }
@@ -259,8 +269,8 @@ where
     }
 
     /// The first switched-off node, which is the one a double click turns on.
-    fn first_free_node(&self, chain_idx: usize) -> Option<usize> {
-        self.nodes(chain_idx)
+    fn first_free_node(&self) -> Option<usize> {
+        self.nodes()
             .nodes
             .iter()
             .position(|node| node.node_type.value() == EqNodeType::Off)
@@ -306,11 +316,12 @@ fn end_gesture(cx: &mut EventContext, param_ptr: ParamPtr) {
     cx.emit(RawParamEvent::EndSetParameter(param_ptr));
 }
 
-impl<L, LSelected, LChain> View for Analyzer<L, LSelected, LChain>
+impl<L, LSelected, LChain, LNewChannel> View for Analyzer<L, LSelected, LChain, LNewChannel>
 where
     L: 'static + Lens<Target = CompressorDirection>,
     LSelected: 'static + Lens<Target = Option<(usize, usize)>>,
     LChain: 'static + Lens<Target = usize>,
+    LNewChannel: 'static + Lens<Target = EqNodeChannel>,
 {
     fn element(&self) -> Option<&'static str> {
         Some("analyzer")
@@ -319,13 +330,15 @@ where
     fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
         let direction = self.edited_direction.get(cx);
         let chain_idx = self.edited_chain.get(cx);
+        // Creating a node while a single chain is picked should give it to that chain only
+        let new_node_channel = self.new_node_channel.get(cx);
 
         event.map(|window_event, meta| match window_event {
             WindowEvent::MouseDown(MouseButton::Left) => {
                 let (x, y) = (cx.mouse().cursorx, cx.mouse().cursory);
                 if let Some(node_index) = self.node_at(cx, chain_idx, direction, x, y) {
-                    let node = self.nodes(chain_idx).nodes[node_index].snapshot();
-                    let (frequency_ptr, gain_ptr) = self.drag_param_ptrs(chain_idx, node_index);
+                    let node = self.nodes().nodes[node_index].snapshot();
+                    let (frequency_ptr, gain_ptr) = self.drag_param_ptrs(node_index);
 
                     // One gesture spanning the whole drag, rather than one per mouse move
                     begin_gesture(cx, frequency_ptr);
@@ -349,8 +362,7 @@ where
             }
             WindowEvent::MouseUp(MouseButton::Left) => {
                 if let Some(drag) = self.drag.take() {
-                    let (frequency_ptr, gain_ptr) =
-                        self.drag_param_ptrs(drag.chain_idx, drag.node_index);
+                    let (frequency_ptr, gain_ptr) = self.drag_param_ptrs(drag.node_index);
                     end_gesture(cx, frequency_ptr);
                     end_gesture(cx, gain_ptr);
 
@@ -376,8 +388,7 @@ where
                 let gain_db =
                     drag.start_gain_db - (((y - drag.start_cursor.1) / bounds.h) * DB_RANGE);
 
-                let (frequency_ptr, gain_ptr) =
-                    self.drag_param_ptrs(drag.chain_idx, drag.node_index);
+                let (frequency_ptr, gain_ptr) = self.drag_param_ptrs(drag.node_index);
                 set_param_value(cx, frequency_ptr, ln_frequency.exp());
                 set_param_value(cx, gain_ptr, gain_db);
 
@@ -391,7 +402,7 @@ where
 
                 // Scrolling over a handle adjusts its Q. Multiplying rather than adding keeps the
                 // steps feeling even across the parameter's skewed range.
-                let node = &self.nodes(chain_idx).nodes[node_index];
+                let node = &self.nodes().nodes[node_index];
                 let q = node.q.value() * SCROLL_Q_FACTOR.powf(*scroll_y);
                 set_param(cx, node.q.as_ptr(), q);
 
@@ -402,7 +413,7 @@ where
 
                 // Double clicking an existing node switches it off, which is how it gets deleted
                 if let Some(node_index) = self.node_at(cx, chain_idx, direction, x, y) {
-                    let node = &self.nodes(chain_idx).nodes[node_index];
+                    let node = &self.nodes().nodes[node_index];
                     set_param(
                         cx,
                         node.node_type.as_ptr(),
@@ -418,7 +429,7 @@ where
                 }
 
                 // Otherwise it creates one at the pointer, if there's a spare
-                let Some(node_index) = self.first_free_node(chain_idx) else {
+                let Some(node_index) = self.first_free_node() else {
                     return;
                 };
                 let bounds = cx.bounds();
@@ -429,7 +440,7 @@ where
                 let t = ((x - bounds.x) / bounds.w).clamp(0.0, 1.0);
                 let frequency = (LN_FREQ_RANGE_START_HZ + (LN_FREQ_RANGE * t)).exp();
 
-                let node = &self.nodes(chain_idx).nodes[node_index];
+                let node = &self.nodes().nodes[node_index];
                 set_param(cx, node.center_frequency.as_ptr(), frequency);
                 set_param(cx, node.gain_db.as_ptr(), 0.0);
                 // Deleting a node only switches its type off, so a reused slot would otherwise
@@ -438,6 +449,11 @@ where
                     cx,
                     node.target.as_ptr(),
                     EqNodeTarget::Both.to_index() as f32,
+                );
+                set_param(
+                    cx,
+                    node.channel.as_ptr(),
+                    new_node_channel.to_index() as f32,
                 );
                 set_param(
                     cx,
@@ -495,11 +511,12 @@ where
     }
 }
 
-impl<L, LSelected, LChain> Analyzer<L, LSelected, LChain>
+impl<L, LSelected, LChain, LNewChannel> Analyzer<L, LSelected, LChain, LNewChannel>
 where
     L: 'static + Lens<Target = CompressorDirection>,
     LSelected: 'static + Lens<Target = Option<(usize, usize)>>,
     LChain: 'static + Lens<Target = usize>,
+    LNewChannel: 'static + Lens<Target = EqNodeChannel>,
 {
     /// Overlays the threshold curves over the spectrum analyzer. The upwards and downwards curves
     /// can have different shapes as well as different offsets, so both are always drawn.
@@ -522,7 +539,7 @@ where
             let (curve_params, eq_params, offset_db) =
                 curve_inputs(&self.params, chain_idx, direction);
             let curve = Curve::new(&curve_params);
-            let eq_curve = EqCurve::new(&eq_params, direction);
+            let eq_curve = EqCurve::new(&eq_params, direction, chain_idx);
 
             let color = match direction {
                 CompressorDirection::Upwards => UPWARDS_THRESHOLD_CURVE_COLOR,
@@ -588,7 +605,7 @@ where
             let (curve_params, eq_params, offset_db) =
                 curve_inputs(&self.params, chain_idx, direction);
             let curve = Curve::new(&curve_params);
-            let eq_curve = EqCurve::new(&eq_params, direction);
+            let eq_curve = EqCurve::new(&eq_params, direction, chain_idx);
 
             let is_edited = direction == edited_direction;
             let color = curve_color(
@@ -600,7 +617,10 @@ where
             );
 
             for (index, node) in eq_params.nodes.iter().enumerate() {
-                if node.node_type == EqNodeType::Off || !node.target.applies_to(direction) {
+                if node.node_type == EqNodeType::Off
+                    || !node.target.applies_to(direction)
+                    || !node.channel.applies_to(chain_idx)
+                {
                     continue;
                 }
 
@@ -859,7 +879,7 @@ fn curve_inputs(
 
     (
         params.threshold.curve_params(curve),
-        chain.eq.snapshot(),
+        params.threshold.eq.snapshot(),
         curve.threshold_offset_db.value(),
     )
 }
