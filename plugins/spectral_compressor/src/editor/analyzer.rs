@@ -193,41 +193,43 @@ where
     /// Where a node's handle is drawn, as `[0, 1]` fractions of the analyzer's bounds. Mirrors
     /// Where each active node's handle is drawn, as `[0, 1]` fractions of the analyzer's bounds.
     ///
-    /// Mirrors what [`Self::draw_nodes()`] does, so hit testing and drawing cannot disagree about
-    /// where a node is. The composite curve is built once for the whole bank rather than once per
-    /// node, which matters because this runs on every click and scroll.
-    fn node_positions_t(
-        &self,
-        chain_idx: usize,
-        direction: CompressorDirection,
-    ) -> Vec<(usize, f32, f32)> {
-        let (curve_params, eq_params, offset_db) = curve_inputs(&self.params, chain_idx, direction);
-        let curve = Curve::new(&curve_params);
-        let eq_curve = EqCurve::new(&eq_params, direction, chain_idx);
+    /// [`Self::draw_nodes()`] places the handles from this too, so hit testing and drawing cannot
+    /// disagree about where a node is. Each line's composite curve is built once rather than once
+    /// per node, which matters because this runs on every click and scroll.
+    fn node_positions_t(&self, chain_idx: usize) -> Vec<(usize, CompressorDirection, f32, f32)> {
+        let mut positions = Vec::new();
 
-        // Only nodes that deform this curve get a handle on it, so a node assigned to the other
-        // compressor can't be grabbed here
-        eq_params
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|(_, node)| {
-                node.node_type != EqNodeType::Off
-                    && node.target.applies_to(direction)
-                    && node.channel.applies_to(chain_idx)
-            })
-            .map(|(index, node)| {
+        // Both lines are collected, so a handle on the one that isn't focused can still be found.
+        // A node applying to both gets a handle on each; they are the same node, so dragging
+        // either moves both.
+        for direction in [CompressorDirection::Upwards, CompressorDirection::Downwards] {
+            let (curve_params, eq_params, offset_db) =
+                curve_inputs(&self.params, chain_idx, direction);
+            let curve = Curve::new(&curve_params);
+            let eq_curve = EqCurve::new(&eq_params, direction, chain_idx);
+
+            for (index, node) in eq_params.nodes.iter().enumerate() {
+                if node.node_type == EqNodeType::Off
+                    || !node.target.applies_to(direction)
+                    || !node.channel.applies_to(chain_idx)
+                {
+                    continue;
+                }
+
                 let y_db = curve.evaluate_ln(node.center_frequency.ln())
                     + eq_curve.evaluate_db(node.center_frequency)
                     + offset_db;
 
-                (
+                positions.push((
                     index,
+                    direction,
                     frequency_to_t(node.center_frequency),
                     1.0 - db_to_unclamped_t(y_db),
-                )
-            })
-            .collect()
+                ));
+            }
+        }
+
+        positions
     }
 
     /// The parameters a drag moves: the node's frequency and its gain.
@@ -237,20 +239,22 @@ where
         (node.center_frequency.as_ptr(), node.gain_db.as_ptr())
     }
 
-    /// The active node whose handle is under `(x, y)`, if any.
+    /// The node whose handle is under `(x, y)`, and the line it was grabbed on.
+    ///
+    /// Handles on the line that isn't focused are grabbable too. Clicking one is how the focus
+    /// moves onto it, which beats having to notice it belongs to the other line first.
     fn node_at(
         &self,
         cx: &EventContext,
         chain_idx: usize,
-        direction: CompressorDirection,
         x: f32,
         y: f32,
-    ) -> Option<usize> {
+    ) -> Option<(usize, CompressorDirection)> {
         let bounds = cx.bounds();
         let radius = NODE_RADIUS * cx.scale_factor() * 2.0;
 
-        let mut closest: Option<(usize, f32)> = None;
-        for (index, t_x, t_y) in self.node_positions_t(chain_idx, direction) {
+        let mut closest: Option<((usize, CompressorDirection), f32)> = None;
+        for (index, direction, t_x, t_y) in self.node_positions_t(chain_idx) {
             let dx = (bounds.x + (bounds.w * t_x)) - x;
             let dy = (bounds.y + (bounds.h * t_y)) - y;
             let distance_squared = (dx * dx) + (dy * dy);
@@ -259,11 +263,11 @@ where
             }
 
             if closest.is_none_or(|(_, best)| distance_squared < best) {
-                closest = Some((index, distance_squared));
+                closest = Some(((index, direction), distance_squared));
             }
         }
 
-        closest.map(|(index, _)| index)
+        closest.map(|(hit, _)| hit)
     }
 
     /// The first switched-off node, which is the one a double click turns on.
@@ -334,8 +338,13 @@ where
         event.map(|window_event, meta| match window_event {
             WindowEvent::MouseDown(MouseButton::Left) => {
                 let (x, y) = (cx.mouse().cursorx, cx.mouse().cursory);
-                if let Some(node_index) = self.node_at(cx, chain_idx, direction, x, y) {
+                if let Some((node_index, node_direction)) = self.node_at(cx, chain_idx, x, y) {
                     let node = self.nodes().nodes[node_index].snapshot();
+                    // A node applying to both lines belongs to neither in particular, so the focus
+                    // stays put; the buttons above the graph remain the way to change it.
+                    if node.target != EqNodeTarget::Both && node_direction != direction {
+                        cx.emit(EditorEvent::SelectDirection(node_direction));
+                    }
                     let (frequency_ptr, gain_ptr) = self.drag_param_ptrs(node_index);
 
                     // One gesture spanning the whole drag, rather than one per mouse move
@@ -394,7 +403,7 @@ where
             }
             WindowEvent::MouseScroll(_scroll_x, scroll_y) => {
                 let (x, y) = (cx.mouse().cursorx, cx.mouse().cursory);
-                let Some(node_index) = self.node_at(cx, chain_idx, direction, x, y) else {
+                let Some((node_index, _)) = self.node_at(cx, chain_idx, x, y) else {
                     return;
                 };
 
@@ -409,20 +418,9 @@ where
             WindowEvent::MouseDoubleClick(MouseButton::Left) => {
                 let (x, y) = (cx.mouse().cursorx, cx.mouse().cursory);
 
-                // Double clicking an existing node switches it off, which is how it gets deleted
-                if let Some(node_index) = self.node_at(cx, chain_idx, direction, x, y) {
-                    let node = &self.nodes().nodes[node_index];
-                    set_param(
-                        cx,
-                        node.node_type.as_ptr(),
-                        EqNodeType::Off.to_index() as f32,
-                    );
-
-                    // A drag was started by the first click of this double click
-                    self.drag = None;
-                    cx.release();
-                    cx.set_active(false);
-                    meta.consume();
+                // Double clicking a handle does nothing. Removing one is a button in the inspector
+                // below the graph, which leaves double click free to always mean "create".
+                if self.node_at(cx, chain_idx, x, y).is_some() {
                     return;
                 }
 
@@ -443,11 +441,11 @@ where
                 set_param(cx, node.gain_db.as_ptr(), 0.0);
                 // Deleting a node only switches its type off, so a reused slot would otherwise
                 // inherit whatever target it had before
-                set_param(
-                    cx,
-                    node.target.as_ptr(),
-                    EqNodeTarget::Both.to_index() as f32,
-                );
+                let target = match direction {
+                    CompressorDirection::Upwards => EqNodeTarget::Upwards,
+                    CompressorDirection::Downwards => EqNodeTarget::Downwards,
+                };
+                set_param(cx, node.target.as_ptr(), target.to_index() as f32);
                 set_param(
                     cx,
                     node.channel.as_ptr(),
@@ -592,69 +590,46 @@ where
         let bounds = cx.bounds();
         let scale_factor = cx.scale_factor();
 
-        // The edited curve's handles go down last so they end up on top, where they can be grabbed
-        let mut directions = [CompressorDirection::Upwards, CompressorDirection::Downwards];
-        if directions[0] == edited_direction {
-            directions.swap(0, 1);
-        }
+        // Positions come from the same function hit testing uses, so the two cannot disagree about
+        // where a node is. The focused line's handles go down last so they end up on top.
+        let mut positions = self.node_positions_t(chain_idx);
+        positions.sort_by_key(|(_, direction, _, _)| *direction == edited_direction);
 
         canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
-        for direction in directions {
-            let (curve_params, eq_params, offset_db) =
-                curve_inputs(&self.params, chain_idx, direction);
-            let curve = Curve::new(&curve_params);
-            let eq_curve = EqCurve::new(&eq_params, direction, chain_idx);
+        for (index, direction, t_x, t_y) in positions {
+            if !(0.0..=1.0).contains(&t_x) {
+                continue;
+            }
 
-            let is_edited = direction == edited_direction;
             let color = curve_color(
                 match direction {
                     CompressorDirection::Upwards => UPWARDS_THRESHOLD_CURVE_COLOR,
                     CompressorDirection::Downwards => DOWNWARDS_THRESHOLD_CURVE_COLOR,
                 },
-                is_edited,
+                direction == edited_direction,
             );
 
-            for (index, node) in eq_params.nodes.iter().enumerate() {
-                if node.node_type == EqNodeType::Off
-                    || !node.target.applies_to(direction)
-                    || !node.channel.applies_to(chain_idx)
-                {
-                    continue;
-                }
+            // The selected node is drawn larger so it's obvious which one the inspector below the
+            // graph is editing
+            let radius = if selected_node == Some((chain_idx, index)) {
+                NODE_RADIUS * 1.6
+            } else {
+                NODE_RADIUS
+            };
 
-                let t = frequency_to_t(node.center_frequency);
-                if !(0.0..=1.0).contains(&t) {
-                    continue;
-                }
+            let x = bounds.x + (bounds.w * t_x);
+            let y = bounds.y + (bounds.h * t_y);
+            let mut path = vg::Path::new();
+            path.circle(x, y, radius * scale_factor);
 
-                let y_db = curve.evaluate_ln(node.center_frequency.ln())
-                    + eq_curve.evaluate_db(node.center_frequency)
-                    + offset_db;
-                let y_t = db_to_unclamped_t(y_db);
-
-                let x = bounds.x + (bounds.w * t);
-                let y = bounds.y + (bounds.h * (1.0 - y_t));
-
-                // The selected node is drawn larger so it's obvious which one the inspector below
-                // the graph is editing
-                let radius = if is_edited && selected_node == Some((chain_idx, index)) {
-                    NODE_RADIUS * 1.6
-                } else {
-                    NODE_RADIUS
-                };
-
-                let mut path = vg::Path::new();
-                path.circle(x, y, radius * scale_factor);
-
-                // A filled center with a ring around it stays legible against both the dark
-                // background and the bright spectrum
-                canvas.fill_path(&path, &vg::Paint::color(color));
-                canvas.stroke_path(
-                    &path,
-                    &vg::Paint::color(vg::Color::rgbaf(0.05, 0.05, 0.05, 0.9))
-                        .with_line_width(1.5 * scale_factor),
-                );
-            }
+            // A filled center with a ring around it stays legible against both the dark background
+            // and the bright spectrum
+            canvas.fill_path(&path, &vg::Paint::color(color));
+            canvas.stroke_path(
+                &path,
+                &vg::Paint::color(vg::Color::rgbaf(0.05, 0.05, 0.05, 0.9))
+                    .with_line_width(1.5 * scale_factor),
+            );
         }
         canvas.reset_scissor();
     }
