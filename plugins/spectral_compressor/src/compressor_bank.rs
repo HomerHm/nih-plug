@@ -1026,7 +1026,8 @@ impl CompressorBank {
         let upwards_knee_width_db = params.compressors.upwards.knee_width_db.value();
         let chain_idx = chain_for_channel(channel_idx);
 
-        assert!(analyzer_input_data.gain_difference_db.len() >= buffer.len());
+        assert!(analyzer_input_data.gain_difference_db[chain_idx].len() >= buffer.len());
+        assert!(analyzer_input_data.envelope_followers[chain_idx].len() >= buffer.len());
         assert!(self.downwards_thresholds_db[chain_idx].len() == buffer.len());
         assert!(self.downwards_ratios.len() == buffer.len());
         assert!(self.downwards_knee_parabola_scale[chain_idx].len() == buffer.len());
@@ -1133,7 +1134,8 @@ impl CompressorBank {
         let other_channels_t = params.threshold.sc_channel_link.value() / num_channels;
         let this_channel_t = 1.0 - (other_channels_t * (num_channels - 1.0));
 
-        assert!(analyzer_input_data.gain_difference_db.len() >= buffer.len());
+        assert!(analyzer_input_data.gain_difference_db[chain_idx].len() >= buffer.len());
+        assert!(analyzer_input_data.envelope_followers[chain_idx].len() >= buffer.len());
         assert!(self.sidechain_spectrum_magnitudes[channel_idx].len() == buffer.len());
         assert!(self.downwards_thresholds_db[chain_idx].len() == buffer.len());
         assert!(self.downwards_ratios.len() == buffer.len());
