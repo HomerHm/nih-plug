@@ -21,13 +21,12 @@ use nih_plug_vizia::vizia::vg;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use super::EditorEvent;
+use super::{ChainMode, EditorEvent};
 use crate::analyzer::AnalyzerData;
+use crate::compressor_bank::NUM_CHAINS;
 use crate::curve::{Curve, CurveParams};
 use crate::eq_curve::CompressorDirection;
-use crate::eq_curve::{
-    EqBankParams, EqCurve, EqCurveParams, EqNodeChannel, EqNodeTarget, EqNodeType,
-};
+use crate::eq_curve::{EqBankParams, EqCurve, EqCurveParams, EqNodeTarget, EqNodeType};
 use crate::SpectralCompressorParams;
 use nih_plug::prelude::{Enum, Param, ParamPtr};
 use nih_plug_vizia::widgets::RawParamEvent;
@@ -109,9 +108,13 @@ const DOWNWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.82, 0.34, 
 /// Upwards compression lifts, so it gets the cooler one.
 const UPWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.25, 0.50, 0.82, 0.9);
 
+/// Below this the other chain's spectrum isn't drawn at all. At a full channel link the two chains
+/// detect on the same signal, so what's being skipped is a second copy of the line already there.
+const OTHER_CHAIN_ALPHA_FLOOR: f32 = 0.01;
+
 /// A very analyzer showing the envelope followers as a magnitude spectrum with an overlay for the
 /// gain reduction.
-pub struct Analyzer<L, LSelected, LChain, LNewChannel> {
+pub struct Analyzer<L, LSelected, LMode> {
     analyzer_data: Arc<Mutex<triple_buffer::Output<AnalyzerData>>>,
     sample_rate: Arc<AtomicF32>,
     /// Which compressor's curve the mouse acts on. Read during both drawing and event handling,
@@ -123,10 +126,16 @@ pub struct Analyzer<L, LSelected, LChain, LNewChannel> {
     drag: Option<NodeDrag>,
     /// Which node the inspector below the graph is editing, so its handle can be marked.
     selected_node: LSelected,
-    /// Which chain the mouse acts on, alongside `edited_direction`.
-    edited_chain: LChain,
-    /// The channel a newly created node is given.
-    new_node_channel: LNewChannel,
+    /// The chain this graph draws, and the one every mouse event on it acts on.
+    ///
+    /// Baked in at build time rather than read from a lens: each graph is one chain, so clicking a
+    /// graph is what picks the chain. The layout rebuilds nothing when the mode changes, it just
+    /// shows or hides the second graph.
+    chain_idx: usize,
+    /// Whether the chains are linked, which decides what a new node is given and whether the other
+    /// chain's spectrum is drawn behind this one. A lens, because it changes without this graph
+    /// being rebuilt.
+    chain_mode: LMode,
 }
 
 /// A node handle being dragged.
@@ -136,18 +145,16 @@ pub struct Analyzer<L, LSelected, LChain, LNewChannel> {
 /// the cursor.
 struct NodeDrag {
     node_index: usize,
-    chain_idx: usize,
     start_frequency: f32,
     start_gain_db: f32,
     start_cursor: (f32, f32),
 }
 
-impl<L, LSelected, LChain, LNewChannel> Analyzer<L, LSelected, LChain, LNewChannel>
+impl<L, LSelected, LMode> Analyzer<L, LSelected, LMode>
 where
     L: Lens<Target = CompressorDirection>,
-    LSelected: Lens<Target = Option<(usize, usize)>>,
-    LChain: Lens<Target = usize>,
-    LNewChannel: Lens<Target = EqNodeChannel>,
+    LSelected: Lens<Target = Option<usize>>,
+    LMode: Lens<Target = ChainMode>,
 {
     /// Creates a new [`Analyzer`].
     pub fn new<LAnalyzerData, LRate, LParams>(
@@ -157,15 +164,14 @@ where
         params: LParams,
         edited_direction: L,
         selected_node: LSelected,
-        edited_chain: LChain,
-        new_node_channel: LNewChannel,
+        chain_idx: usize,
+        chain_mode: LMode,
     ) -> Handle<'_, Self>
     where
         LAnalyzerData: Lens<Target = Arc<Mutex<triple_buffer::Output<AnalyzerData>>>>,
         LRate: Lens<Target = Arc<AtomicF32>>,
         LParams: Lens<Target = Arc<SpectralCompressorParams>>,
-        LChain: Lens<Target = usize>,
-        LNewChannel: Lens<Target = EqNodeChannel>,
+        LMode: Lens<Target = ChainMode>,
     {
         Self {
             analyzer_data: analyzer_data.get(cx),
@@ -174,8 +180,8 @@ where
             edited_direction,
             drag: None,
             selected_node,
-            edited_chain,
-            new_node_channel,
+            chain_idx,
+            chain_mode,
         }
         .build(
             cx,
@@ -196,7 +202,11 @@ where
     /// [`Self::draw_nodes()`] places the handles from this too, so hit testing and drawing cannot
     /// disagree about where a node is. Each line's composite curve is built once rather than once
     /// per node, which matters because this runs on every click and scroll.
-    fn node_positions_t(&self, chain_idx: usize) -> Vec<(usize, CompressorDirection, f32, f32)> {
+    fn node_positions_t(
+        &self,
+        chain_idx: usize,
+        chain_mode: ChainMode,
+    ) -> Vec<(usize, CompressorDirection, f32, f32)> {
         let mut positions = Vec::new();
 
         // Both lines are collected, so a handle on the one that isn't focused can still be found.
@@ -208,9 +218,15 @@ where
             let curve = Curve::new(&curve_params);
 
             for (index, node) in eq_params.nodes.iter().enumerate() {
+                // Linked means one curve, and `merge_chains()` sees to it that every node really
+                // does apply to both chains. One that slipped past that -- from a preset, from
+                // automation, from the host writing the parameter directly -- would otherwise
+                // vanish from the only graph there is, so nothing is filtered by channel here.
+                let hidden_by_channel =
+                    chain_mode == ChainMode::Split && !node.channel.applies_to(chain_idx);
                 if node.node_type == EqNodeType::Off
                     || !node.target.applies_to(direction)
-                    || !node.channel.applies_to(chain_idx)
+                    || hidden_by_channel
                 {
                     continue;
                 }
@@ -246,6 +262,7 @@ where
         &self,
         cx: &EventContext,
         chain_idx: usize,
+        chain_mode: ChainMode,
         x: f32,
         y: f32,
     ) -> Option<(usize, CompressorDirection)> {
@@ -253,7 +270,7 @@ where
         let radius = NODE_RADIUS * cx.scale_factor() * 2.0;
 
         let mut closest: Option<((usize, CompressorDirection), f32)> = None;
-        for (index, direction, t_x, t_y) in self.node_positions_t(chain_idx) {
+        for (index, direction, t_x, t_y) in self.node_positions_t(chain_idx, chain_mode) {
             let dx = (bounds.x + (bounds.w * t_x)) - x;
             let dy = (bounds.y + (bounds.h * t_y)) - y;
             let distance_squared = (dx * dx) + (dy * dy);
@@ -317,12 +334,11 @@ fn end_gesture(cx: &mut EventContext, param_ptr: ParamPtr) {
     cx.emit(RawParamEvent::EndSetParameter(param_ptr));
 }
 
-impl<L, LSelected, LChain, LNewChannel> View for Analyzer<L, LSelected, LChain, LNewChannel>
+impl<L, LSelected, LMode> View for Analyzer<L, LSelected, LMode>
 where
     L: 'static + Lens<Target = CompressorDirection>,
-    LSelected: 'static + Lens<Target = Option<(usize, usize)>>,
-    LChain: 'static + Lens<Target = usize>,
-    LNewChannel: 'static + Lens<Target = EqNodeChannel>,
+    LSelected: 'static + Lens<Target = Option<usize>>,
+    LMode: 'static + Lens<Target = ChainMode>,
 {
     fn element(&self) -> Option<&'static str> {
         Some("analyzer")
@@ -330,14 +346,17 @@ where
 
     fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
         let direction = self.edited_direction.get(cx);
-        let chain_idx = self.edited_chain.get(cx);
-        // Creating a node while a single chain is picked should give it to that chain only
-        let new_node_channel = self.new_node_channel.get(cx);
+        let chain_idx = self.chain_idx;
+        let chain_mode = self.chain_mode.get(cx);
+        // Creating a node on one chain's graph should give it to that chain only
+        let new_node_channel = chain_mode.new_node_channel(chain_idx);
 
         event.map(|window_event, meta| match window_event {
             WindowEvent::MouseDown(MouseButton::Left) => {
                 let (x, y) = (cx.mouse().cursorx, cx.mouse().cursory);
-                if let Some((node_index, node_direction)) = self.node_at(cx, chain_idx, x, y) {
+                if let Some((node_index, node_direction)) =
+                    self.node_at(cx, chain_idx, chain_mode, x, y)
+                {
                     let node = self.nodes().nodes[node_index].snapshot();
                     // A node applying to both lines belongs to neither in particular, so the focus
                     // stays put; the buttons above the graph remain the way to change it.
@@ -352,7 +371,6 @@ where
 
                     self.drag = Some(NodeDrag {
                         node_index,
-                        chain_idx,
                         start_frequency: node.center_frequency,
                         start_gain_db: node.gain_db,
                         start_cursor: (x, y),
@@ -402,7 +420,7 @@ where
             }
             WindowEvent::MouseScroll(_scroll_x, scroll_y) => {
                 let (x, y) = (cx.mouse().cursorx, cx.mouse().cursory);
-                let Some((node_index, _)) = self.node_at(cx, chain_idx, x, y) else {
+                let Some((node_index, _)) = self.node_at(cx, chain_idx, chain_mode, x, y) else {
                     return;
                 };
 
@@ -419,7 +437,7 @@ where
 
                 // Double clicking a handle removes it. There is no ambiguity with creating one:
                 // the hit test already tells a handle apart from empty space.
-                if let Some((node_index, _)) = self.node_at(cx, chain_idx, x, y) {
+                if let Some((node_index, _)) = self.node_at(cx, chain_idx, chain_mode, x, y) {
                     let node = &self.nodes().nodes[node_index];
                     set_param(
                         cx,
@@ -484,7 +502,8 @@ where
 
         let edited_direction = self.edited_direction.get(cx);
         let selected_node = self.selected_node.get(cx);
-        let chain_idx = self.edited_chain.get(cx);
+        let chain_idx = self.chain_idx;
+        let chain_mode = self.chain_mode.get(cx);
 
         // The analyzer data is pulled directly from the spectral `CompressorBank`
         let mut analyzer_data = self.analyzer_data.lock().unwrap();
@@ -492,10 +511,51 @@ where
         let nyquist = self.sample_rate.load(Ordering::Relaxed) / 2.0;
 
         draw_grid(cx, canvas);
-        draw_spectrum(cx, canvas, analyzer_data, nyquist, chain_idx);
+
+        // Linked draws one curve but there are still two chains underneath it, carrying two
+        // different signals. The other one is drawn behind this one so its peaks aren't simply
+        // missing from the only graph there is.
+        //
+        // How different the two can be is exactly what the channel link controls: at 100% both
+        // chains detect on the same mixed signal, so the two spectra really do coincide and fading
+        // the second one out hides nothing. At 0% they are fully independent and it is drawn in
+        // full. The envelopes written for the analyzer are the post-mixing ones, so this tracks the
+        // real difference rather than approximating it.
+        if chain_mode == ChainMode::Linked {
+            let other_chain_alpha = 1.0 - self.params.global.channel_link.value();
+            if other_chain_alpha > OTHER_CHAIN_ALPHA_FLOOR {
+                for other_idx in (0..NUM_CHAINS).filter(|idx| *idx != chain_idx) {
+                    draw_spectrum(
+                        cx,
+                        canvas,
+                        analyzer_data,
+                        nyquist,
+                        other_idx,
+                        other_chain_alpha,
+                    );
+                    draw_gain_reduction(
+                        cx,
+                        canvas,
+                        analyzer_data,
+                        nyquist,
+                        other_idx,
+                        other_chain_alpha,
+                    );
+                }
+            }
+        }
+
+        draw_spectrum(cx, canvas, analyzer_data, nyquist, chain_idx, 1.0);
         self.draw_threshold_curves(cx, canvas, chain_idx, edited_direction);
-        self.draw_nodes(cx, canvas, chain_idx, edited_direction, selected_node);
-        draw_gain_reduction(cx, canvas, analyzer_data, nyquist, chain_idx);
+        self.draw_nodes(
+            cx,
+            canvas,
+            chain_idx,
+            chain_mode,
+            edited_direction,
+            selected_node,
+        );
+        draw_gain_reduction(cx, canvas, analyzer_data, nyquist, chain_idx, 1.0);
 
         // Draw the border last
         let border_width = cx.border_width();
@@ -519,12 +579,11 @@ where
     }
 }
 
-impl<L, LSelected, LChain, LNewChannel> Analyzer<L, LSelected, LChain, LNewChannel>
+impl<L, LSelected, LMode> Analyzer<L, LSelected, LMode>
 where
     L: 'static + Lens<Target = CompressorDirection>,
-    LSelected: 'static + Lens<Target = Option<(usize, usize)>>,
-    LChain: 'static + Lens<Target = usize>,
-    LNewChannel: 'static + Lens<Target = EqNodeChannel>,
+    LSelected: 'static + Lens<Target = Option<usize>>,
+    LMode: 'static + Lens<Target = ChainMode>,
 {
     /// Overlays the threshold curves over the spectrum analyzer. The upwards and downwards curves
     /// can have different shapes as well as different offsets, so both are always drawn.
@@ -596,15 +655,16 @@ where
         cx: &mut DrawContext,
         canvas: &mut Canvas,
         chain_idx: usize,
+        chain_mode: ChainMode,
         edited_direction: CompressorDirection,
-        selected_node: Option<(usize, usize)>,
+        selected_node: Option<usize>,
     ) {
         let bounds = cx.bounds();
         let scale_factor = cx.scale_factor();
 
         // Positions come from the same function hit testing uses, so the two cannot disagree about
         // where a node is. The focused line's handles go down last so they end up on top.
-        let mut positions = self.node_positions_t(chain_idx);
+        let mut positions = self.node_positions_t(chain_idx, chain_mode);
         positions.sort_by_key(|(_, direction, _, _)| *direction == edited_direction);
 
         canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
@@ -623,7 +683,7 @@ where
 
             // The selected node is drawn larger so it's obvious which one the inspector below the
             // graph is editing
-            let radius = if selected_node == Some((chain_idx, index)) {
+            let radius = if selected_node == Some(index) {
                 NODE_RADIUS * 1.6
             } else {
                 NODE_RADIUS
@@ -657,17 +717,22 @@ fn db_to_unclamped_t(db_value: f32) -> f32 {
 /// Draw the spectrum analyzer part of the analyzer. These are drawn as vertical bars until the
 /// spacing between the bars becomes less the line width, at which point it's drawn as a solid mesh
 /// instead.
+///
+/// `alpha` scales the whole thing, so the chain that isn't being edited can be drawn behind the one
+/// that is.
 fn draw_spectrum(
     cx: &mut DrawContext,
     canvas: &mut Canvas,
     analyzer_data: &AnalyzerData,
     nyquist_hz: f32,
     chain_idx: usize,
+    alpha: f32,
 ) {
     let bounds = cx.bounds();
 
     let line_width = cx.scale_factor() * 1.5;
-    let text_color: vg::Color = cx.font_color().into();
+    let mut text_color: vg::Color = cx.font_color().into();
+    text_color.a *= alpha;
     // This is used to draw the individual bars
     let bars_paint = vg::Paint::color(text_color).with_line_width(line_width);
     // And this color is used to draw the mesh part of the spectrum. We'll create a gradient paint
@@ -869,18 +934,22 @@ fn curve_inputs(
 }
 
 /// Overlays the gain reduction display over the spectrum analyzer.
-/// Overlays the gain reduction display over the spectrum analyzer.
+///
+/// `alpha` scales it the same way it scales the spectrum, so a faded chain fades as a whole.
 fn draw_gain_reduction(
     cx: &mut DrawContext,
     canvas: &mut Canvas,
     analyzer_data: &AnalyzerData,
     nyquist_hz: f32,
     chain_idx: usize,
+    alpha: f32,
 ) {
     let bounds = cx.bounds();
 
     // As with the above, anti aliasing only causes issues
-    let paint = vg::Paint::color(GR_BAR_OVERLAY_COLOR).with_anti_alias(false);
+    let mut color = GR_BAR_OVERLAY_COLOR;
+    color.a *= alpha;
+    let paint = vg::Paint::color(color).with_anti_alias(false);
 
     let bin_frequency = |bin_idx: f32| (bin_idx / analyzer_data.num_bins as f32) * nyquist_hz;
 

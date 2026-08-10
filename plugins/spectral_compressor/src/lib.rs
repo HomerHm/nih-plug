@@ -17,6 +17,7 @@
 use analyzer::AnalyzerData;
 use atomic_float::AtomicF32;
 use crossbeam::atomic::AtomicCell;
+use editor::ChainMode;
 use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
 use realfft::num_complex::Complex32;
@@ -101,6 +102,11 @@ pub struct SpectralCompressorParams {
     /// restored.
     #[persist = "editor-state"]
     pub editor_state: Arc<ViziaState>,
+    /// Whether the editor keeps the two chains linked or edits them apart. This decides the
+    /// window's height, so it has to be readable from `editor_state`'s size function, which runs
+    /// outside the editor. Saved with the project so reopening it doesn't resize the window.
+    #[persist = "chain-mode"]
+    pub chain_mode: Arc<AtomicCell<ChainMode>>,
 
     // NOTE: These `Arc`s are only here temporarily to work around Vizia's Lens requirements so we
     // can use the generic UIs
@@ -313,8 +319,11 @@ impl SpectralCompressorParams {
     /// Create a new [`SpectralCompressorParams`] object. Changing any of the compressor threshold
     /// or ratio parameters causes the passed compressor bank's parameters to be updated.
     pub fn new(compressor_bank: &compressor_bank::CompressorBank) -> Self {
+        let chain_mode: Arc<AtomicCell<ChainMode>> = Arc::default();
+
         SpectralCompressorParams {
-            editor_state: editor::default_state(),
+            editor_state: editor::default_state(chain_mode.clone()),
+            chain_mode,
 
             // TODO: Do still enable per-block smoothing for these settings, because why not. This
             //       will require updating the compressor bank.
@@ -374,7 +383,10 @@ impl Plugin for SpectralCompressor {
                 sample_rate: self.sample_rate.clone(),
 
                 edited_direction: eq_curve::CompressorDirection::Downwards,
-                edited_chain: editor::ChainSelection::Both,
+                // The mode is persisted, so a reopened editor picks up where it left off. The
+                // model's copy has to start from the same value the window was sized with.
+                chain_mode: self.params.chain_mode.load(),
+                chain_mode_cell: self.params.chain_mode.clone(),
                 solo: self.solo.clone(),
                 selected_node: None,
             },

@@ -22,6 +22,17 @@ use nih_plug_vizia::widgets::RawParamEvent;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Events a [`ParamLink`] handles itself.
+pub enum ParamLinkEvent {
+    /// Copy every leader's value onto its follower right now.
+    ///
+    /// A link driven by a parameter notices the moment it is switched on by watching that
+    /// parameter. One driven by editor state has nothing to watch, so it has to be told.
+    ///
+    /// The innermost link consumes this, so it reaches exactly one of a set of nested links.
+    AdoptLeaderValues,
+}
+
 /// A container that keeps pairs of parameters in lockstep while a boolean parameter is enabled.
 ///
 /// Widgets report edits by emitting [`RawParamEvent`]s that bubble up towards the root, so a view
@@ -116,6 +127,15 @@ where
     }
 
     fn event(&mut self, cx: &mut EventContext, event: &mut Event) {
+        event.map(|link_event: &ParamLinkEvent, meta| match link_event {
+            ParamLinkEvent::AdoptLeaderValues => {
+                self.adopt_leader_values(cx);
+                // Consumed so an enclosing link doesn't fire as well. These are nested, and the
+                // outer one pairs up parameters this has no business touching.
+                meta.consume();
+            }
+        });
+
         event.map(|param_event: &RawParamEvent, _| {
             let ptr = match param_event {
                 RawParamEvent::BeginSetParameter(ptr)
