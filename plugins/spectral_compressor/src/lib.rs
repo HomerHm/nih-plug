@@ -102,9 +102,8 @@ pub struct SpectralCompressorParams {
     /// restored.
     #[persist = "editor-state"]
     pub editor_state: Arc<ViziaState>,
-    /// Whether the editor keeps the two chains linked or edits them apart. This decides the
-    /// window's height, so it has to be readable from `editor_state`'s size function, which runs
-    /// outside the editor. Saved with the project so reopening it doesn't resize the window.
+    /// Whether the editor keeps the two chains linked or edits them apart. Saved with the project
+    /// so reopening it doesn't throw away which view was being used.
     #[persist = "chain-mode"]
     pub chain_mode: Arc<AtomicCell<ChainMode>>,
 
@@ -319,11 +318,9 @@ impl SpectralCompressorParams {
     /// Create a new [`SpectralCompressorParams`] object. Changing any of the compressor threshold
     /// or ratio parameters causes the passed compressor bank's parameters to be updated.
     pub fn new(compressor_bank: &compressor_bank::CompressorBank) -> Self {
-        let chain_mode: Arc<AtomicCell<ChainMode>> = Arc::default();
-
         SpectralCompressorParams {
-            editor_state: editor::default_state(chain_mode.clone()),
-            chain_mode,
+            editor_state: editor::default_state(),
+            chain_mode: Arc::default(),
 
             // TODO: Do still enable per-block smoothing for these settings, because why not. This
             //       will require updating the compressor bank.

@@ -37,17 +37,17 @@ mod param_link;
 /// The GUI's width, in logical pixels. Wide enough for the four control columns below the
 /// analyzer to sit side by side.
 const GUI_WIDTH: u32 = 1360;
-/// The GUI's height with one analyzer, in logical pixels.
+/// The GUI's height, in logical pixels.
 ///
-/// The controls take exactly as much vertical space as they need and the analyzer absorbs whatever
-/// is left over, so this number only sets how much room the analyzer gets. Growing a control
-/// column can therefore never truncate it -- it just eats into the analyzer.
-const GUI_HEIGHT: u32 = 900;
-/// The GUI's height in [`ChainMode::Split`], which stacks a second analyzer.
+/// The controls take exactly as much vertical space as they need and the analyzers absorb whatever
+/// is left over, so this number only sets how much room they get. Growing a control column can
+/// therefore never truncate anything -- it just eats into the graphs.
 ///
-/// The extra room goes to the second graph rather than to the controls, so both end up roughly the
-/// height a single one has in [`GUI_HEIGHT`].
-const SPLIT_GUI_HEIGHT: u32 = 1230;
+/// This has to fit [`ChainMode::Split`]'s two stacked graphs, since the window does not change size
+/// between the modes (see [`default_state()`] for why). Measured from the running editor, that
+/// leaves each of the two graphs 379 logical pixels, against 934 for the single graph in
+/// [`ChainMode::Linked`].
+const GUI_HEIGHT: u32 = 1392;
 // I couldn't get `LayoutType::Grid` to work as expected, so we'll fake a 4x4 grid with
 // hardcoded column widths
 const COLUMN_WIDTH: Units = Pixels(330.0);
@@ -168,8 +168,8 @@ pub struct Data {
     /// `AtomicCell` alone would leave the `Arc` itself unchanged when the mode is switched, so
     /// nothing bound to it through a lens would ever be told to update.
     pub(crate) chain_mode: ChainMode,
-    /// The same value as [`Self::chain_mode`], in the form the window's `size_fn` can read: that
-    /// closure runs outside the editor, where the model is not reachable.
+    /// The same value as [`Self::chain_mode`], in the form that gets saved with the project. The
+    /// mode decides how much of the editor is on screen, so it should survive reopening.
     pub(crate) chain_mode_cell: Arc<AtomicCell<ChainMode>>,
     /// Which chain is being listened to on its own, shared with the audio thread. Not a parameter,
     /// so it is never saved with a project: leaving a solo engaged should not outlive the session.
@@ -196,15 +196,16 @@ impl Model for Data {
     }
 }
 
-/// The editor's window size, which grows to fit the second analyzer in [`ChainMode::Split`].
-///
-/// This reads the mode through an `AtomicCell` because it is called from outside the editor, and
-/// possibly while it is closed.
-pub(crate) fn default_state(chain_mode: Arc<AtomicCell<ChainMode>>) -> Arc<ViziaState> {
-    ViziaState::new(move || match chain_mode.load() {
-        ChainMode::Linked => (GUI_WIDTH, GUI_HEIGHT),
-        ChainMode::Split => (GUI_WIDTH, SPLIT_GUI_HEIGHT),
-    })
+/// The editor's window size, which is the same in both chain modes.
+pub(crate) fn default_state() -> Arc<ViziaState> {
+    // NOTE: This deliberately does not vary with the chain mode. Growing the window when the
+    //       second graph appears would be the nicer behaviour, but programmatic resizing is broken
+    //       on macOS: baseview only emits `WindowEvent::Resized` from
+    //       `view_did_change_backing_properties`, which fires on a DPI change and not on
+    //       `setFrameSize`. vizia therefore never learns about the new size and keeps laying out
+    //       against the old one, which put the two graphs at a third of their height and left every
+    //       mouse coordinate offset from what was drawn. A fixed window has neither problem.
+    ViziaState::new(|| (GUI_WIDTH, GUI_HEIGHT))
 }
 
 pub(crate) fn create(editor_state: Arc<ViziaState>, editor_data: Data) -> Option<Box<dyn Editor>> {
@@ -384,12 +385,12 @@ fn analyzer_toolbar(cx: &mut Context) {
             Button::new(
                 cx,
                 move |cx| {
+                    let Some(current_mode) = cx.data::<Data>().map(|data| data.chain_mode) else {
+                        return;
+                    };
                     // Switching to linked merges the chains, so re-clicking the engaged button
                     // would throw away edits for no reason
-                    if cx
-                        .data::<Data>()
-                        .is_some_and(|data| data.chain_mode == mode)
-                    {
+                    if current_mode == mode {
                         return;
                     }
 
@@ -397,9 +398,6 @@ fn analyzer_toolbar(cx: &mut Context) {
                         merge_chains(cx);
                     }
                     cx.emit(EditorEvent::SetChainMode(mode));
-                    // `default_state()`'s size function reads the mode, so this is what actually
-                    // resizes the window to fit the second graph
-                    cx.emit(GuiContextEvent::Resize);
                 },
                 move |cx| Label::new(cx, mode.name()).font_size(12.0),
             )
