@@ -238,7 +238,7 @@ impl Default for GlobalParams {
             stereo_mode: EnumParam::new("Stereo Mode", StereoMode::LeftRight),
             // Defaults to fully independent, which is the behaviour this plugin has always had
             channel_link: FloatParam::new(
-                "Channel Link",
+                "Detection Link",
                 0.0,
                 FloatRange::Linear { min: 0.0, max: 1.0 },
             )

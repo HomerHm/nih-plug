@@ -108,9 +108,18 @@ const DOWNWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.82, 0.34, 
 /// Upwards compression lifts, so it gets the cooler one.
 const UPWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.25, 0.50, 0.82, 0.9);
 
-/// Below this the other chain's spectrum isn't drawn at all. At a full channel link the two chains
-/// detect on the same signal, so what's being skipped is a second copy of the line already there.
+/// Below this the other chain's spectrum isn't drawn at all. At a full detection link the two
+/// chains detect on the same signal, so what's being skipped is a second copy of the line already
+/// there.
 const OTHER_CHAIN_ALPHA_FLOOR: f32 = 0.01;
+
+/// How visible the other chain's spectrum is in [`ChainMode::Split`], where it is drawn as a
+/// reference rather than to fill something in.
+///
+/// Constant rather than following the detection link, unlike in [`ChainMode::Linked`]: raising the
+/// link is what pulls the two chains' detection signals together, so this line has to stay visible
+/// for that to be watchable.
+const OTHER_CHAIN_SPECTRUM_ALPHA: f32 = 0.3;
 
 /// A very analyzer showing the envelope followers as a magnitude spectrum with an overlay for the
 /// gain reduction.
@@ -512,27 +521,39 @@ where
 
         draw_grid(cx, canvas);
 
-        // Linked draws one curve but there are still two chains underneath it, carrying two
-        // different signals. The other one is drawn behind this one so its peaks aren't simply
-        // missing from the only graph there is.
+        // Both modes draw the other chain's spectrum behind this one, but for different reasons,
+        // and so at different opacities.
         //
-        // How different the two can be is exactly what the channel link controls: at 100% both
-        // chains detect on the same mixed signal, so the two spectra really do coincide and fading
-        // the second one out hides nothing. At 0% they are fully independent and it is drawn in
-        // full. The envelopes written for the analyzer are the post-mixing ones, so this tracks the
-        // real difference rather than approximating it.
-        if chain_mode == ChainMode::Linked {
-            let other_chain_alpha = 1.0 - self.params.global.channel_link.value();
-            if other_chain_alpha > OTHER_CHAIN_ALPHA_FLOOR {
-                for other_idx in (0..NUM_CHAINS).filter(|idx| *idx != chain_idx) {
-                    draw_spectrum(
-                        cx,
-                        canvas,
-                        analyzer_data,
-                        nyquist,
-                        other_idx,
-                        other_chain_alpha,
-                    );
+        // What makes this exact rather than approximate: the envelopes written for the analyzer
+        // (`compressor_bank.rs`) are the ones the detection link has already mixed, so these two
+        // lines are the actual detection signals the compressors act on.
+        let other_chain_alpha = match chain_mode {
+            // One graph, so without this the second chain's peaks would simply be missing from the
+            // only graph there is. At a full detection link both chains detect on the same mixed
+            // signal, so the two really do coincide and fading it out hides nothing.
+            ChainMode::Linked => 1.0 - self.params.global.channel_link.value(),
+            // Each chain already has its own graph, so this is a reference point instead: raising
+            // the detection link pulls the two lines together, and that convergence is the thing
+            // worth watching. Fading it out with the link would hide it at exactly the moment it
+            // becomes visible, so it stays at a constant wash.
+            ChainMode::Split => OTHER_CHAIN_SPECTRUM_ALPHA,
+        };
+
+        if other_chain_alpha > OTHER_CHAIN_ALPHA_FLOOR {
+            for other_idx in (0..NUM_CHAINS).filter(|idx| *idx != chain_idx) {
+                draw_spectrum(
+                    cx,
+                    canvas,
+                    analyzer_data,
+                    nyquist,
+                    other_idx,
+                    other_chain_alpha,
+                );
+
+                // A gain reduction bar says how much *that* chain is being compressed, which is
+                // not this graph's subject once each chain has one of its own. Drawing it would
+                // also blend on top of this chain's bars and read as a brighter reading here.
+                if chain_mode == ChainMode::Linked {
                     draw_gain_reduction(
                         cx,
                         canvas,
