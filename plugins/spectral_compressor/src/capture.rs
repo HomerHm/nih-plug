@@ -42,6 +42,12 @@ const GATE_RANGE_DB: f32 = 40.0;
 /// can't contribute negative infinity to the average.
 const CAPTURE_FLOOR_DB: f32 = -140.0;
 
+/// Frames quieter than this are treated as silence outright, whatever else has been captured.
+///
+/// Sits well above [`CAPTURE_FLOOR_DB`] so that a frame with any real content at all clears it,
+/// and far below anything audible so that no quiet music is ever thrown away.
+const CAPTURE_SILENCE_DB: f32 = CAPTURE_FLOOR_DB + 20.0;
+
 /// The natural logarithm of [`CAPTURE_MIN_HZ`].
 const LN_MIN_HZ: f32 = 2.995_732_3; // 20.0f32.ln()
 /// The natural logarithm of [`CAPTURE_MAX_HZ`].
@@ -125,6 +131,15 @@ impl CaptureSlot {
         // so every octave gets the same say in it, which is a better level estimate for this
         // purpose than a linear-frequency average would be.
         let frame_level_db = frame_db.iter().sum::<f32>() / CAPTURE_GRID_LEN as f32;
+
+        // The relative gate below cannot catch silence at the start of a capture, since there is
+        // no peak to be quiet relative to yet. Without this an empty channel would fill its slot
+        // with a flat curve pegged at the clamp floor and look for all the world like a real
+        // capture -- which is what a mono sidechain does to the side chain in mid/side mode.
+        if frame_level_db < CAPTURE_SILENCE_DB {
+            return false;
+        }
+
         if frame_level_db > self.peak_level_db {
             self.peak_level_db = frame_level_db;
         } else if frame_level_db < self.peak_level_db - GATE_RANGE_DB {
@@ -957,6 +972,28 @@ mod tests {
         // Eighty decibels down is silence between takes, and must not drag the curve toward flat
         assert!(!slot.push(&[-80.0; CAPTURE_GRID_LEN]));
         assert_eq!(slot.frame_count, 2);
+    }
+
+    /// The relative gate has nothing to compare against on the first frame, so silence at the start
+    /// of a capture needs catching outright. A mono sidechain in mid/side mode hits this: the side
+    /// chain is genuinely empty, and without this its slot would fill with a flat curve pegged at
+    /// the clamp floor and be indistinguishable from a real capture.
+    #[test]
+    fn digital_silence_never_fills_a_slot() {
+        let mut slot = CaptureSlot::default();
+
+        assert!(!slot.push(&[CAPTURE_FLOOR_DB; CAPTURE_GRID_LEN]));
+        assert!(slot.is_empty(), "silence must leave the slot empty");
+
+        // Still empty after a whole capture's worth of it
+        for _ in 0..1000 {
+            slot.push(&[CAPTURE_FLOOR_DB; CAPTURE_GRID_LEN]);
+        }
+        assert!(slot.is_empty());
+
+        // And real content still gets in, including content that is very quiet
+        assert!(slot.push(&[-100.0; CAPTURE_GRID_LEN]));
+        assert!(!slot.is_empty());
     }
 
     #[test]

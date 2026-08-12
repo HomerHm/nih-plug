@@ -531,6 +531,18 @@ impl Plugin for SpectralCompressor {
                 compressor_bank::ThresholdMode::Internal
             );
 
+        // The main buffer was converted above but the sidechain never was, so in mid/side mode the
+        // second chain was detecting on the sidechain's *right* channel rather than its side
+        // channel. A mono sidechain made that plain: side should be silent, and instead it carried
+        // the whole signal. Both sidechain threshold modes had the same mismatch.
+        //
+        // Converting in place rather than into a copy is sanctioned: nih-plug documents auxiliary
+        // input buffers as safe to overwrite (`audio_setup.rs`). It is skipped when the sidechain
+        // STFT is not going to run, so nothing is touched that isn't about to be read.
+        if mid_side && needs_sidechain {
+            convert_mid_side(&mut aux.inputs[0]);
+        }
+
         match self.params.threshold.mode.value() {
             compressor_bank::ThresholdMode::Internal if !needs_sidechain => self
                 .stft
