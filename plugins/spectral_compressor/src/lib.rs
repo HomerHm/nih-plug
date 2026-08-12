@@ -401,6 +401,7 @@ impl Plugin for SpectralCompressor {
                 capture_active: self.capture_active.clone(),
                 capture_clear: self.capture_clear.clone(),
                 capture_state: self.params.threshold.capture.state.clone(),
+                capturing: false,
                 selected_node: None,
             },
         )

@@ -50,3 +50,21 @@ analyzer {
   background-color: #c8873c;
   color: #161616;
 }
+
+/* The capture toggle and the button that throws a capture away. Capture is coloured like the solo
+   buttons because it is the same kind of thing: a transient state that changes what the plugin is
+   doing and that nothing else on screen announces. */
+.capture-button {
+  background-color: #3c3c3c;
+  border-radius: 3px;
+  child-left: 10px;
+  child-right: 10px;
+  color: #b4b4b4;
+  top: 1s;
+  bottom: 1s;
+}
+
+.capture-button:checked {
+  background-color: #c8873c;
+  color: #161616;
+}

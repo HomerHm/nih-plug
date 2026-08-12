@@ -20,7 +20,7 @@ use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use self::analyzer::{format_frequency, frequency_to_t, Analyzer, FREQUENCY_TICKS};
@@ -151,6 +151,10 @@ pub enum EditorEvent {
     SelectDirection(CompressorDirection),
     /// Select a node for the inspector below the analyzer, or clear it.
     SelectNode(Option<usize>),
+    /// Start or stop folding the input into the captured curve.
+    ToggleCapture,
+    /// Throw away the current stereo mode's captured curves.
+    ClearCapture,
 }
 
 #[derive(Clone, Lens)]
@@ -187,6 +191,10 @@ pub struct Data {
     /// The captured curves, so the analyzer can draw them and the controls can tell an empty slot
     /// from a filled one.
     pub(crate) capture_state: SharedCaptureState,
+    /// Whether a capture is running. A plain copy of what [`Self::capture_active`] holds, for the
+    /// same reason [`Self::chain_mode`] is one: storing into an `Arc<AtomicBool>` leaves the `Arc`
+    /// itself unchanged, so a button bound to it through a lens would never be told to redraw.
+    pub(crate) capturing: bool,
 }
 
 impl Model for Data {
@@ -201,6 +209,16 @@ impl Model for Data {
             EditorEvent::SelectDirection(direction) => self.edited_direction = *direction,
             EditorEvent::SelectNode(node_index) => {
                 self.selected_node = *node_index;
+            }
+            EditorEvent::ToggleCapture => {
+                self.capturing = !self.capturing;
+                self.capture_active.store(self.capturing, Ordering::SeqCst);
+            }
+            EditorEvent::ClearCapture => {
+                // Stopping first keeps the frames from the block in flight out of the fresh curve
+                self.capturing = false;
+                self.capture_active.store(false, Ordering::SeqCst);
+                self.capture_clear.store(true, Ordering::SeqCst);
             }
         });
     }
@@ -239,6 +257,7 @@ pub(crate) fn create(editor_state: Arc<ViziaState>, editor_data: Data) -> Option
                 // `Stretch` here is what keeps the controls below from ever being clipped: they
                 // take their natural height first and the analyzer gets the remainder.
                 analyzer(cx);
+                capture_bar(cx);
                 controls(cx);
             })
             .row_between(Pixels(10.0));
@@ -488,6 +507,77 @@ fn frequency_scale(cx: &mut Context) {
     })
     .height(Pixels(16.0))
     .top(Pixels(2.0));
+}
+
+/// The capture controls.
+///
+/// A row rather than a fifth column: there is no width left for another one, and this is something
+/// you do once for a track rather than something you keep reaching for.
+///
+/// There is deliberately no "this slot is empty" label. Whether the current stereo mode has a
+/// capture is already on the graph, since the captured curve is drawn when there is one and absent
+/// when there is not, and that reading stays correct on its own. A label would have to be told
+/// when the audio thread finished a capture, which is exactly the update an `Arc` behind a lens
+/// never delivers.
+fn capture_bar(cx: &mut Context) {
+    HStack::new(cx, |cx| {
+        Button::new(
+            cx,
+            |cx| cx.emit(EditorEvent::ToggleCapture),
+            |cx| Label::new(cx, "Capture").font_size(12.0),
+        )
+        .checked(Data::capturing)
+        .class("capture-button");
+
+        Button::new(
+            cx,
+            |cx| cx.emit(EditorEvent::ClearCapture),
+            |cx| Label::new(cx, "Clear").font_size(12.0),
+        )
+        .class("capture-button");
+
+        let params = Data::params;
+        capture_control(cx, "Source", 130.0, |cx| {
+            ParamSlider::new(cx, params, |p| &p.threshold.capture.source)
+                .set_style(ParamSliderStyle::CurrentStepLabeled { even: true })
+                .width(Pixels(130.0));
+        });
+        capture_control(cx, "Amount", 110.0, |cx| {
+            ParamSlider::new(cx, params, |p| &p.threshold.capture.amount).width(Pixels(110.0));
+        });
+        capture_control(cx, "Smoothing", 110.0, |cx| {
+            ParamSlider::new(cx, params, |p| &p.threshold.capture.smoothing_octaves)
+                .width(Pixels(110.0));
+        });
+        capture_control(cx, "Low", 110.0, |cx| {
+            ParamSlider::new(cx, params, |p| &p.threshold.capture.low_frequency)
+                .width(Pixels(110.0));
+        });
+        capture_control(cx, "High", 110.0, |cx| {
+            ParamSlider::new(cx, params, |p| &p.threshold.capture.high_frequency)
+                .width(Pixels(110.0));
+        });
+    })
+    .height(Auto)
+    .col_between(Pixels(10.0))
+    .child_left(Stretch(1.0))
+    .child_right(Stretch(1.0));
+}
+
+/// One labelled control in the capture row, with the label sitting above the widget.
+fn capture_control(
+    cx: &mut Context,
+    label: &'static str,
+    width: f32,
+    widget: impl FnOnce(&mut Context),
+) {
+    VStack::new(cx, |cx| {
+        Label::new(cx, label).font_size(11.0).color(DARKER_GRAY);
+        widget(cx);
+    })
+    .width(Pixels(width))
+    .height(Auto)
+    .row_between(Pixels(2.0));
 }
 
 fn controls(cx: &mut Context) {

@@ -751,11 +751,12 @@ impl CaptureParams {
             .with_callback(set_update_thresholds.clone())
             .with_unit("%")
             .with_value_to_string(formatters::v2s_f32_percentage(0))
-            .with_string_to_value(formatters::s2v_f32_percentage()),
+            .with_string_to_value(formatters::s2v_f32_percentage())
+            .hide_in_generic_ui(),
             // The main input always captures something. Sidechain is the mode that makes matching
             // another track practical, but it silently captures nothing if none is routed, so it
             // is not what an unsuspecting first press should do.
-            source: EnumParam::new("Capture Source", CaptureSource::Main),
+            source: EnumParam::new("Capture Source", CaptureSource::Main).hide_in_generic_ui(),
             smoothing_octaves: FloatParam::new(
                 "Capture Smoothing",
                 0.0,
@@ -767,7 +768,8 @@ impl CaptureParams {
             )
             .with_callback(set_update_thresholds.clone())
             .with_unit(" oct")
-            .with_step_size(0.01),
+            .with_step_size(0.01)
+            .hide_in_generic_ui(),
             low_frequency: FloatParam::new(
                 "Capture Low",
                 CAPTURE_MIN_HZ,
@@ -779,7 +781,8 @@ impl CaptureParams {
             )
             .with_callback(set_update_thresholds.clone())
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
-            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz())
+            .hide_in_generic_ui(),
             high_frequency: FloatParam::new(
                 "Capture High",
                 CAPTURE_MAX_HZ,
@@ -791,7 +794,8 @@ impl CaptureParams {
             )
             .with_callback(set_update_thresholds)
             .with_value_to_string(formatters::v2s_f32_hz_then_khz(0))
-            .with_string_to_value(formatters::s2v_f32_hz_then_khz()),
+            .with_string_to_value(formatters::s2v_f32_hz_then_khz())
+            .hide_in_generic_ui(),
         }
     }
 }

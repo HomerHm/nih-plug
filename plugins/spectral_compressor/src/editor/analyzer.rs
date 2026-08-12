@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use super::{ChainMode, EditorEvent};
 use crate::analyzer::AnalyzerData;
+use crate::capture::{smooth_into, CaptureBlend, CaptureCurve};
 use crate::compressor_bank::NUM_CHAINS;
 use crate::curve::{Curve, CurveParams};
 use crate::eq_curve::CompressorDirection;
@@ -107,6 +108,10 @@ const GR_BAR_OVERLAY_COLOR: vg::Color = vg::Color::rgbaf(0.85, 0.95, 1.0, 0.8);
 const DOWNWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.82, 0.34, 0.32, 0.9);
 /// Upwards compression lifts, so it gets the cooler one.
 const UPWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.25, 0.50, 0.82, 0.9);
+
+/// The captured curve, drawn as a reference rather than as something editable. Neutral so it does
+/// not read as a third threshold curve.
+const CAPTURE_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.72, 0.72, 0.60, 0.45);
 
 /// Below this the other chain's spectrum isn't drawn at all. At a full detection link the two
 /// chains detect on the same signal, so what's being skipped is a second copy of the line already
@@ -567,7 +572,20 @@ where
         }
 
         draw_spectrum(cx, canvas, analyzer_data, nyquist, chain_idx, 1.0);
-        self.draw_threshold_curves(cx, canvas, chain_idx, edited_direction);
+        // Read once per frame and shared by both directions, since it does not depend on which
+        // compressor is being drawn
+        let capture_smoothed = self.smoothed_capture();
+        if let Some(smoothed) = capture_smoothed.as_deref() {
+            self.draw_capture_curve(cx, canvas, chain_idx, smoothed);
+        }
+
+        self.draw_threshold_curves(
+            cx,
+            canvas,
+            chain_idx,
+            edited_direction,
+            capture_smoothed.as_deref(),
+        );
         self.draw_nodes(
             cx,
             canvas,
@@ -608,12 +626,84 @@ where
 {
     /// Overlays the threshold curves over the spectrum analyzer. The upwards and downwards curves
     /// can have different shapes as well as different offsets, so both are always drawn.
+    /// This chain's captured curve for the current stereo mode, smoothed exactly the way the
+    /// compressor bank smooths it. `None` when nothing has been captured into that slot.
+    ///
+    /// Allocating per frame rather than keeping a scratch buffer around: `draw()` only has `&self`,
+    /// this is a kilobyte, and it already takes a lock and reads a triple buffer right above.
+    fn smoothed_capture(&self) -> Option<Vec<f32>> {
+        let capture = &self.params.threshold.capture;
+        let stereo_mode_idx = self.params.global.stereo_mode.value().to_index();
+
+        capture.state.read(|state| {
+            let slot = state.slot(stereo_mode_idx, self.chain_idx);
+            if slot.is_empty() {
+                return None;
+            }
+
+            let mut smoothed = vec![0.0; slot.curve_db.len()];
+            smooth_into(
+                &slot.curve_db,
+                &mut smoothed,
+                capture.smoothing_octaves.value(),
+            );
+
+            Some(smoothed)
+        })
+    }
+
+    /// Draw the captured shape on its own, as it would sit at a full amount.
+    ///
+    /// Worth its own line rather than leaving it to show through the threshold curves: it stays
+    /// visible while the amount is turned down for an A/B, it is what grows while a capture is
+    /// running, and its absence is how an empty slot looks.
+    fn draw_capture_curve(
+        &self,
+        cx: &mut DrawContext,
+        canvas: &mut Canvas,
+        chain_idx: usize,
+        capture_smoothed: &[f32],
+    ) {
+        let bounds = cx.bounds();
+        let num_points = 100.min(bounds.w.ceil() as usize);
+
+        // Pinned against the curve the graph is otherwise built around, so it lands where the
+        // threshold would if the amount were all the way up
+        let (curve_params, _, offset_db) =
+            curve_inputs(&self.params, chain_idx, CompressorDirection::Downwards);
+        let curve = CaptureCurve::new(capture_smoothed, curve_params.center_frequency.ln());
+
+        let paint = vg::Paint::color(CAPTURE_CURVE_COLOR).with_line_width(cx.scale_factor() * 2.0);
+        let mut path = vg::Path::new();
+        for i in 0..num_points {
+            let x_t = i as f32 / (num_points - 1) as f32;
+            let ln_freq = LN_FREQ_RANGE_START_HZ + (LN_FREQ_RANGE * x_t);
+
+            let y_db = curve_params.intercept + curve.evaluate_ln(ln_freq) + offset_db;
+            let y_t = db_to_unclamped_t(y_db);
+
+            let physical_x_pos = bounds.x + (bounds.w * x_t);
+            let physical_y_pos = bounds.y + (bounds.h * (1.0 - y_t));
+
+            if i == 0 {
+                path.move_to(physical_x_pos, physical_y_pos);
+            } else {
+                path.line_to(physical_x_pos, physical_y_pos);
+            }
+        }
+
+        canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
+        canvas.stroke_path(&path, &paint);
+        canvas.reset_scissor();
+    }
+
     fn draw_threshold_curves(
         &self,
         cx: &mut DrawContext,
         canvas: &mut Canvas,
         chain_idx: usize,
         edited_direction: CompressorDirection,
+        capture_smoothed: Option<&[f32]>,
     ) {
         let bounds = cx.bounds();
 
@@ -628,6 +718,10 @@ where
                 curve_inputs(&self.params, chain_idx, direction);
             let curve = Curve::new(&curve_params);
             let eq_curve = EqCurve::new(&eq_params, direction, chain_idx);
+            // The compressor bank folds the capture into its thresholds, so leaving it out here
+            // would draw a curve that no longer matches the one being heard
+            let capture_blend = capture_smoothed
+                .map(|smoothed| capture_blend_for(&self.params, &curve_params, smoothed));
 
             let color = match direction {
                 CompressorDirection::Upwards => UPWARDS_THRESHOLD_CURVE_COLOR,
@@ -644,8 +738,14 @@ where
                 // Evaluating the curve results in a value in dB, which must then be mapped to the
                 // same scale used in `draw_spectrum()`. The nodes are evaluated the same way the
                 // compressor bank does it, so the drawn curve matches the audible one.
-                let y_db =
-                    curve.evaluate_ln(ln_freq) + eq_curve.evaluate_db(ln_freq.exp()) + offset_db;
+                let polynomial_db = curve.evaluate_ln(ln_freq);
+                let capture_delta_db = capture_blend
+                    .as_ref()
+                    .map_or(0.0, |blend| blend.delta_ln(ln_freq, polynomial_db));
+                let y_db = polynomial_db
+                    + capture_delta_db
+                    + eq_curve.evaluate_db(ln_freq.exp())
+                    + offset_db;
                 let y_t = db_to_unclamped_t(y_db);
 
                 let physical_x_pos = bounds.x + (bounds.w * x_t);
@@ -936,6 +1036,24 @@ fn draw_grid(cx: &mut DrawContext, canvas: &mut Canvas) {
 /// the curve froze at whatever it last saw, or at the default, whose zero center frequency makes
 /// `ln(0)` and turns the whole curve into NaN. Reading the parameters directly keeps the curve
 /// live whether or not audio is flowing.
+/// Build the capture blend for one curve, matching what `CompressorBank::capture_blend()` does.
+///
+/// The two have to agree exactly: this one draws the curve and that one is what the audio hears.
+fn capture_blend_for<'a>(
+    params: &SpectralCompressorParams,
+    curve_params: &CurveParams,
+    capture_smoothed: &'a [f32],
+) -> CaptureBlend<'a> {
+    CaptureBlend::new(
+        capture_smoothed,
+        curve_params.center_frequency.ln(),
+        curve_params.intercept,
+        params.threshold.capture.amount.value(),
+        params.threshold.capture.low_frequency.value(),
+        params.threshold.capture.high_frequency.value(),
+    )
+}
+
 fn curve_inputs(
     params: &SpectralCompressorParams,
     chain_idx: usize,
