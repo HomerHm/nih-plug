@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 
 use super::{ChainMode, EditorEvent};
 use crate::analyzer::AnalyzerData;
-use crate::capture::{smooth_into, CaptureBlend, CaptureCurve};
-use crate::compressor_bank::NUM_CHAINS;
+use crate::capture::{smooth_into, CaptureBlend};
+use crate::compressor_bank::{LF_BYPASS_FADE_OCTAVES, LF_BYPASS_OFF_HZ, NUM_CHAINS};
 use crate::curve::{Curve, CurveParams};
 use crate::eq_curve::CompressorDirection;
 use crate::eq_curve::{EqBankParams, EqCurve, EqCurveParams, EqNodeTarget, EqNodeType};
@@ -108,6 +108,10 @@ const GR_BAR_OVERLAY_COLOR: vg::Color = vg::Color::rgbaf(0.85, 0.95, 1.0, 0.8);
 const DOWNWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.82, 0.34, 0.32, 0.9);
 /// Upwards compression lifts, so it gets the cooler one.
 const UPWARDS_THRESHOLD_CURVE_COLOR: vg::Color = vg::Color::rgbaf(0.25, 0.50, 0.82, 0.9);
+
+/// The wash laid over the range the low frequency bypass leaves alone. Dark rather than tinted, so
+/// it reads as "nothing happens here" instead of as another kind of processing.
+const LF_BYPASS_WASH_COLOR: vg::Color = vg::Color::rgbaf(0.0, 0.0, 0.0, 0.45);
 
 /// The captured curve, drawn as a reference rather than as something editable. Neutral so it does
 /// not read as a third threshold curve.
@@ -615,6 +619,11 @@ where
         );
         draw_gain_reduction(cx, canvas, analyzer_data, nyquist, chain_idx, 1.0);
 
+        // Last of the content, so it dims the spectrum, the curves, and the bars together. Any of
+        // those still drawn at full strength inside the bypassed range would suggest something is
+        // happening there.
+        self.draw_lf_bypass(cx, canvas, chain_idx);
+
         // Draw the border last
         let border_width = cx.border_width();
         let border_color: vg::Color = cx.border_color().into();
@@ -645,6 +654,45 @@ where
 {
     /// Overlays the threshold curves over the spectrum analyzer. The upwards and downwards curves
     /// can have different shapes as well as different offsets, so both are always drawn.
+    /// Wash over the range this chain's low frequency bypass leaves uncompressed.
+    ///
+    /// The right edge is feathered across the same half octave the weights fade over, so what the
+    /// eye reads as the edge of the shaded area is where compression actually comes back rather
+    /// than a line drawn near it.
+    fn draw_lf_bypass(&self, cx: &mut DrawContext, canvas: &mut Canvas, chain_idx: usize) {
+        let corner_hz = self.params.threshold.chains[chain_idx]
+            .bypass_below_hz
+            .value();
+        if corner_hz <= LF_BYPASS_OFF_HZ {
+            return;
+        }
+
+        let bounds = cx.bounds();
+        let full_hz = corner_hz * LF_BYPASS_FADE_OCTAVES.exp2();
+        let corner_x = bounds.x + (bounds.w * frequency_to_t(corner_hz));
+        let full_x = bounds.x + (bounds.w * frequency_to_t(full_hz));
+        if full_x <= bounds.x {
+            return;
+        }
+
+        let mut path = vg::Path::new();
+        path.rect(bounds.x, bounds.y, full_x - bounds.x, bounds.h);
+
+        // Solid up to the corner, then fading out across the transition
+        let paint = vg::Paint::linear_gradient(
+            corner_x,
+            bounds.y,
+            full_x,
+            bounds.y,
+            LF_BYPASS_WASH_COLOR,
+            vg::Color::rgbaf(0.0, 0.0, 0.0, 0.0),
+        );
+
+        canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
+        canvas.fill_path(&path, &paint);
+        canvas.reset_scissor();
+    }
+
     /// This chain's captured curve for the current stereo mode, smoothed exactly the way the
     /// compressor bank smooths it. `None` when nothing has been captured into that slot.
     ///

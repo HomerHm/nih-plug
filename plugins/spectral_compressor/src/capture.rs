@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::compressor_bank::NUM_CHAINS;
 use crate::curve::smoothstep;
+use crate::eq_curve::power_to_db;
 
 /// How many stereo modes there are. The capture is stored separately per mode because the two
 /// chains hold completely different signals in each one: left/right versus mid/side. A right
@@ -363,6 +364,13 @@ pub struct CaptureBank {
     binner: CaptureBinner,
     /// Scratch holding one frame's grid values.
     frame_db: Vec<f32>,
+    /// One channel's complex spectrum, held while the other is on its way, so the stereo mode the
+    /// plugin is *not* in can be derived from the pair.
+    ///
+    /// A single buffer serves both capture sources: within one hop every sidechain channel is
+    /// handled before any main channel, so the sidechain's pair is finished with before the main
+    /// one starts.
+    snapshot: Vec<Complex32>,
     shared: SharedCaptureState,
     /// The shared state's generation as of the last pull, so a preset load gets noticed.
     last_generation: u32,
@@ -382,10 +390,11 @@ impl CaptureBank {
     /// Create the capture, along with the shared handles the parameters and the editor need. It
     /// owns them for the same reason the compressor bank owns its update flags: the parameter
     /// object is built from the compressor bank, so this side has to exist first.
-    pub fn new() -> Self {
+    pub fn new(complex_buffer_len: usize) -> Self {
         let shared: SharedCaptureState = Arc::new(PersistedCapture::default());
 
         Self {
+            snapshot: Vec::with_capacity(complex_buffer_len),
             last_generation: shared.generation(),
             local: CaptureState::default(),
             binner: CaptureBinner::default(),
@@ -412,6 +421,12 @@ impl CaptureBank {
     /// The flag the editor raises to throw the current stereo mode's curves away.
     pub fn clear_flag(&self) -> Arc<AtomicBool> {
         self.clear_requested.clone()
+    }
+
+    /// Make room for a larger window size, so folding a frame never has to allocate.
+    pub fn reserve(&mut self, complex_buffer_len: usize) {
+        self.snapshot
+            .reserve_exact(complex_buffer_len.saturating_sub(self.snapshot.len()));
     }
 
     /// Whether a capture is running right now.
@@ -481,40 +496,59 @@ impl CaptureBank {
         }
     }
 
-    /// Fold one channel's bin magnitudes into its curve. Only call this while a capture is
+    /// Fold one channel's bins into its own curve, and once the second channel of the same frame
+    /// arrives, into the other stereo mode's curves as well. Only call this while a capture is
     /// running; see [`Self::is_active()`].
-    pub fn push_frame(
-        &mut self,
-        magnitudes: &[f32],
-        ln_freqs: &[f32],
-        stereo_mode_idx: usize,
-        chain_idx: usize,
-    ) {
-        if !self.binner.fold(magnitudes, ln_freqs, &mut self.frame_db) {
-            return;
-        }
-
-        self.local
-            .slot_mut(stereo_mode_idx, chain_idx)
-            .push(&self.frame_db);
-    }
-
-    /// The same as [`Self::push_frame()`], but reading the FFT bins directly. This is what the
-    /// main input uses, since its magnitudes have to be taken before compression scales the bins.
+    ///
+    /// Filling both modes is what stops switching between left/right and mid/side from revealing an
+    /// empty slot. It has to work from the bins rather than from the stored magnitudes: the
+    /// conversion is a sum of complex spectra, and `|left| + |right|` is not `|left + right|`.
     pub fn push_bins(
         &mut self,
         bins: &[Complex32],
         ln_freqs: &[f32],
         stereo_mode_idx: usize,
         chain_idx: usize,
+        num_channels: usize,
     ) {
-        if !self.binner.fold_bins(bins, ln_freqs, &mut self.frame_db) {
+        if self.binner.fold_bins(bins, ln_freqs, &mut self.frame_db) {
+            self.local
+                .slot_mut(stereo_mode_idx, chain_idx)
+                .push(&self.frame_db);
+        }
+
+        // Deriving the other mode takes both channels at once, and they arrive one at a time. A
+        // mono layout has no second channel and no meaningful mid/side either, so it stops here.
+        if num_channels != NUM_CHAINS {
             return;
         }
 
-        self.local
-            .slot_mut(stereo_mode_idx, chain_idx)
-            .push(&self.frame_db);
+        if chain_idx == 0 {
+            // `resize` inside the reserved capacity does not allocate, which the audio thread cares
+            // about a great deal
+            self.snapshot.resize(bins.len(), Complex32::default());
+            self.snapshot.copy_from_slice(bins);
+            return;
+        }
+
+        if self.snapshot.len() != bins.len() {
+            return;
+        }
+
+        let other_mode_idx = (stereo_mode_idx + 1) % NUM_STEREO_MODES;
+        for (other_chain_idx, subtract) in [(0usize, false), (1usize, true)] {
+            if self.binner.fold_combined(
+                &self.snapshot,
+                bins,
+                subtract,
+                ln_freqs,
+                &mut self.frame_db,
+            ) {
+                self.local
+                    .slot_mut(other_mode_idx, other_chain_idx)
+                    .push(&self.frame_db);
+            }
+        }
     }
 
     /// Hand the local copy over to the GUI and the host, and reset the interval counter whether or
@@ -547,17 +581,9 @@ impl Default for CaptureBinner {
 }
 
 impl CaptureBinner {
-    /// Fold `magnitudes` onto the grid, writing decibel values into `frame_db`. `ln_freqs` holds
-    /// the natural logarithm of each bin's center frequency. Returns `false` when no bin at all
-    /// landed inside the grid's frequency range, in which case `frame_db` is left untouched.
-    pub fn fold(&mut self, magnitudes: &[f32], ln_freqs: &[f32], frame_db: &mut [f32]) -> bool {
-        let num_bins = magnitudes.len().min(ln_freqs.len());
-        self.accumulate(ln_freqs, num_bins, |bin_idx| magnitudes[bin_idx]);
-        self.fill_gaps(frame_db)
-    }
-
-    /// The same as [`Self::fold()`], but taking the FFT bins directly. Used for the main input,
-    /// where the magnitudes have to be read before compression has had a chance to scale the bins.
+    /// Fold `bins` onto the grid, writing decibel values into `frame_db`. `ln_freqs` holds the
+    /// natural logarithm of each bin's center frequency. Returns `false` when no bin at all landed
+    /// inside the grid's frequency range, in which case `frame_db` is left untouched.
     pub fn fold_bins(
         &mut self,
         bins: &[Complex32],
@@ -565,16 +591,44 @@ impl CaptureBinner {
         frame_db: &mut [f32],
     ) -> bool {
         let num_bins = bins.len().min(ln_freqs.len());
-        self.accumulate(ln_freqs, num_bins, |bin_idx| bins[bin_idx].norm());
+        // Squared magnitudes rather than magnitudes, which saves the square root a `norm()` would
+        // take: the result goes straight into a logarithm either way
+        self.accumulate(ln_freqs, num_bins, |bin_idx| {
+            power_to_db(bins[bin_idx].norm_sqr())
+        });
         self.fill_gaps(frame_db)
     }
 
-    fn accumulate(
+    /// Fold the sum or difference of two channels onto the grid, which is how a capture reaches the
+    /// stereo mode the plugin is *not* currently in.
+    ///
+    /// `mid = (left + right) / sqrt(2)` and `left = (mid + side) / sqrt(2)`, so one expression
+    /// converts in either direction. It is exact rather than an estimate: the transform is linear,
+    /// so it survives the windowing and the FFT untouched. Deriving it from the stored magnitudes
+    /// instead would not work at all, since `|left| + |right|` is not `|left + right|`.
+    pub fn fold_combined(
         &mut self,
+        first: &[Complex32],
+        second: &[Complex32],
+        subtract: bool,
         ln_freqs: &[f32],
-        num_bins: usize,
-        magnitude_at: impl Fn(usize) -> f32,
-    ) {
+        frame_db: &mut [f32],
+    ) -> bool {
+        let num_bins = first.len().min(second.len()).min(ln_freqs.len());
+        self.accumulate(ln_freqs, num_bins, |bin_idx| {
+            let combined = if subtract {
+                first[bin_idx] - second[bin_idx]
+            } else {
+                first[bin_idx] + second[bin_idx]
+            };
+
+            // The 1/sqrt(2) the conversion applies is a half once squared
+            power_to_db(combined.norm_sqr() * 0.5)
+        });
+        self.fill_gaps(frame_db)
+    }
+
+    fn accumulate(&mut self, ln_freqs: &[f32], num_bins: usize, db_at: impl Fn(usize) -> f32) {
         self.sums.fill(0.0);
         self.counts.fill(0);
 
@@ -586,8 +640,8 @@ impl CaptureBinner {
             }
 
             let cell = (position.round() as usize).min(CAPTURE_GRID_LEN - 1);
-            self.sums[cell] +=
-                util::gain_to_db_fast_epsilon(magnitude_at(bin_idx)).max(CAPTURE_FLOOR_DB);
+            // `max` also catches a NaN, since it hands back the other operand for one
+            self.sums[cell] += db_at(bin_idx).max(CAPTURE_FLOOR_DB);
             self.counts[cell] += 1;
         }
     }
@@ -1011,8 +1065,11 @@ mod tests {
         // Two bins an octave apart with a twelve decibel difference between them. Every grid point
         // in between has to be filled by interpolation, because no bin reached it.
         let ln_freqs = [1000.0f32.ln(), 2000.0f32.ln()];
-        let magnitudes = [util::db_to_gain(0.0), util::db_to_gain(12.0)];
-        assert!(binner.fold(&magnitudes, &ln_freqs, &mut frame_db));
+        let bins = [
+            Complex32::new(util::db_to_gain(0.0), 0.0),
+            Complex32::new(util::db_to_gain(12.0), 0.0),
+        ];
+        assert!(binner.fold_bins(&bins, &ln_freqs, &mut frame_db));
 
         let at = |hz: f32| sample_grid(&frame_db, hz.ln());
         assert!((at(1000.0) - 0.0).abs() < 0.2, "got {}", at(1000.0));
@@ -1027,8 +1084,11 @@ mod tests {
         let mut frame_db = [0.0; CAPTURE_GRID_LEN];
 
         let ln_freqs = [1000.0f32.ln(), 2000.0f32.ln()];
-        let magnitudes = [util::db_to_gain(0.0), util::db_to_gain(12.0)];
-        assert!(binner.fold(&magnitudes, &ln_freqs, &mut frame_db));
+        let bins = [
+            Complex32::new(util::db_to_gain(0.0), 0.0),
+            Complex32::new(util::db_to_gain(12.0), 0.0),
+        ];
+        assert!(binner.fold_bins(&bins, &ln_freqs, &mut frame_db));
 
         // Below the lowest bin and above the highest one the curve is flat, not a runaway slope
         assert!((frame_db[0] - 0.0).abs() < 0.2);
@@ -1041,8 +1101,8 @@ mod tests {
         let mut frame_db = [7.0; CAPTURE_GRID_LEN];
 
         let ln_freqs = [1.0f32.ln()];
-        let magnitudes = [1.0];
-        assert!(!binner.fold(&magnitudes, &ln_freqs, &mut frame_db));
+        let bins = [Complex32::new(1.0, 0.0)];
+        assert!(!binner.fold_bins(&bins, &ln_freqs, &mut frame_db));
         // The caller's buffer is left alone so it can't be mistaken for a real measurement
         assert!(frame_db.iter().all(|value| *value == 7.0));
     }
@@ -1148,6 +1208,112 @@ mod tests {
         seen.dedup();
 
         assert_eq!(seen.len(), NUM_STEREO_MODES * NUM_CHAINS);
+    }
+
+    /// A flat frame of `num_bins` bins, all at 1 kHz so every grid point ends up holding the same
+    /// value and any index can be checked.
+    fn flat_bins(real: f32, num_bins: usize) -> (Vec<f32>, Vec<Complex32>) {
+        (
+            vec![1000.0f32.ln(); num_bins],
+            vec![Complex32::new(real, 0.0); num_bins],
+        )
+    }
+
+    /// Root two in decibels, which is what the mid/side conversion's scaling comes to.
+    const ROOT_TWO_DB: f32 = 3.010_3;
+
+    /// Both stereo modes are filled from one capture, so switching between left/right and mid/side
+    /// never reveals an empty slot. A mono frame is the case that proves it is exact: mid has to
+    /// come out three decibels up and side has to come out genuinely empty, which is also what a
+    /// mono sidechain does in mid/side mode.
+    #[test]
+    fn a_mono_frame_derives_a_full_mid_and_an_empty_side() {
+        let (ln_freqs, bins) = flat_bins(0.5, 16);
+        let mut bank = CaptureBank::new(16);
+
+        // Left/right is mode zero, and both of its channels carry the same audio
+        bank.push_bins(&bins, &ln_freqs, 0, 0, 2);
+        bank.push_bins(&bins, &ln_freqs, 0, 1, 2);
+
+        let expected_lr = util::gain_to_db_fast_epsilon(0.5);
+        for chain_idx in 0..NUM_CHAINS {
+            let curve = bank
+                .curve(0, chain_idx)
+                .expect("the captured mode should be filled");
+            assert!(
+                (curve[30] - expected_lr).abs() < 0.1,
+                "chain {chain_idx} got {}",
+                curve[30]
+            );
+        }
+
+        let mid = bank.curve(1, 0).expect("mid should have been derived");
+        assert!(
+            (mid[30] - (expected_lr + ROOT_TWO_DB)).abs() < 0.1,
+            "mid got {}",
+            mid[30]
+        );
+        assert!(
+            bank.curve(1, 1).is_none(),
+            "side has to stay empty for a mono frame"
+        );
+    }
+
+    /// The conversion adds complex spectra, which is exactly why it cannot work from the stored
+    /// magnitudes: these two frames have identical magnitudes and cancel completely.
+    #[test]
+    fn deriving_the_other_mode_uses_phase_rather_than_magnitude() {
+        let (ln_freqs, first) = flat_bins(0.5, 16);
+        let (_, second) = flat_bins(-0.5, 16);
+        let mut bank = CaptureBank::new(16);
+
+        bank.push_bins(&first, &ln_freqs, 0, 0, 2);
+        bank.push_bins(&second, &ln_freqs, 0, 1, 2);
+
+        assert!(
+            bank.curve(1, 0).is_none(),
+            "mid has to cancel to nothing, not to the sum of the magnitudes"
+        );
+        let side = bank.curve(1, 1).expect("side should have been derived");
+        let expected = util::gain_to_db_fast_epsilon(0.5) + ROOT_TWO_DB;
+        assert!((side[30] - expected).abs() < 0.1, "side got {}", side[30]);
+    }
+
+    /// It converts in both directions, since `(a + b) / sqrt(2)` is its own inverse.
+    #[test]
+    fn the_derivation_runs_from_mid_side_back_to_left_right() {
+        let (ln_freqs, mid) = flat_bins(0.5, 16);
+        let (_, side) = flat_bins(0.0, 16);
+        let mut bank = CaptureBank::new(16);
+
+        // Mid/side is mode one, with nothing in the side channel
+        bank.push_bins(&mid, &ln_freqs, 1, 0, 2);
+        bank.push_bins(&side, &ln_freqs, 1, 1, 2);
+
+        let expected = util::gain_to_db_fast_epsilon(0.5) - ROOT_TWO_DB;
+        for chain_idx in 0..NUM_CHAINS {
+            let curve = bank
+                .curve(0, chain_idx)
+                .expect("both sides should have been derived from a centred signal");
+            assert!(
+                (curve[30] - expected).abs() < 0.1,
+                "chain {chain_idx} got {}",
+                curve[30]
+            );
+        }
+    }
+
+    /// A mono layout has no second channel, and no meaningful mid/side either.
+    #[test]
+    fn a_mono_layout_derives_nothing() {
+        let (ln_freqs, bins) = flat_bins(0.5, 16);
+        let mut bank = CaptureBank::new(16);
+
+        bank.push_bins(&bins, &ln_freqs, 0, 0, 1);
+
+        assert!(bank.curve(0, 0).is_some(), "its own slot still fills");
+        assert!(bank.curve(1, 0).is_none());
+        assert!(bank.curve(1, 1).is_none());
     }
 
     /// The slope the threshold curve assumes the audio has, matching `PINK_NOISE_SLOPE` in the

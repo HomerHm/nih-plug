@@ -573,6 +573,7 @@ impl Plugin for SpectralCompressor {
                             &mut self.complex_fft_buffer,
                             fft_plan,
                             &self.window_function,
+                            &self.params,
                             &mut self.compressor_bank,
                             input_gain,
                         );
@@ -753,12 +754,14 @@ fn process_stft_main(
 /// The analysis process function inside of the STFT callback used to compute the frequency
 /// spectrum magnitudes from the sidechain input if the sidechaining option is enabled. All
 /// sidechain channels will be processed before processing the main input
+#[allow(clippy::too_many_arguments)]
 fn process_stft_sidechain(
     channel_idx: usize,
     real_fft_buffer: &mut [f32],
     complex_fft_buffer: &mut [Complex32],
     fft_plan: &Plan,
     window_function: &[f32],
+    params: &SpectralCompressorParams,
     compressor_bank: &mut compressor_bank::CompressorBank,
     input_gain: f32,
 ) {
@@ -772,7 +775,7 @@ fn process_stft_sidechain(
         .r2c_plan
         .process_with_scratch(real_fft_buffer, complex_fft_buffer, &mut [])
         .unwrap();
-    compressor_bank.process_sidechain(complex_fft_buffer, channel_idx);
+    compressor_bank.process_sidechain(complex_fft_buffer, channel_idx, params);
 }
 
 impl ClapPlugin for SpectralCompressor {

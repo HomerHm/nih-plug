@@ -45,13 +45,13 @@ const PINK_NOISE_SLOPE: f32 = -3.0;
 /// This is what makes the parameter's leftmost position mean "off" without needing a separate
 /// switch. Nothing below twenty hertz is audible, and the FFT can barely resolve it either, so
 /// "bypass below twenty hertz" and "no bypass" are the same setting in practice.
-const LF_BYPASS_OFF_HZ: f32 = 20.0;
+pub const LF_BYPASS_OFF_HZ: f32 = 20.0;
 
 /// How far above its corner the low frequency bypass fades back to full compression, in octaves.
 ///
 /// Fixed rather than exposed. Switching compression off between one bin and the next is a step in
 /// the frequency response, and a step there is a long tail in the time domain.
-const LF_BYPASS_FADE_OCTAVES: f32 = 0.5;
+pub const LF_BYPASS_FADE_OCTAVES: f32 = 0.5;
 
 /// The envelopes are initialized to the RMS value of a -24 dB sine wave to make sure extreme upwards
 /// compression doesn't cause pops when switching between window sizes and when deactivating and
@@ -703,7 +703,7 @@ impl CompressorBank {
             window_size: 0,
             sample_rate: 1.0,
 
-            capture: CaptureBank::new(),
+            capture: CaptureBank::new(complex_buffer_len),
             capture_smoothed: vec![0.0; CAPTURE_GRID_LEN],
 
             analyzer_input_data,
@@ -722,6 +722,7 @@ impl CompressorBank {
         self.eq_power
             .reserve_exact(complex_buffer_len.saturating_sub(self.eq_power.len()));
 
+        self.capture.reserve(complex_buffer_len);
         for buffer in self.process_weights.iter_mut() {
             buffer.reserve_exact(complex_buffer_len.saturating_sub(buffer.len()));
         }
@@ -903,20 +904,16 @@ impl CompressorBank {
         // Both chains are always captured, so switching between left/right and mid/side later on
         // never throws a curve away. This runs before the match below because that is where the
         // bins get scaled: what belongs in a capture is the input, not the compressed output.
-        if self.capture.is_active() {
-            let chain_idx = chain_for_channel(channel_idx);
-            match params.threshold.capture.source.value() {
-                CaptureSource::Main => {
-                    self.capture
-                        .push_bins(buffer, &self.ln_freqs, stereo_mode_idx, chain_idx)
-                }
-                CaptureSource::Sidechain => self.capture.push_frame(
-                    &self.sidechain_spectrum_magnitudes[channel_idx],
-                    &self.ln_freqs,
-                    stereo_mode_idx,
-                    chain_idx,
-                ),
-            }
+        if self.capture.is_active()
+            && params.threshold.capture.source.value() == CaptureSource::Main
+        {
+            self.capture.push_bins(
+                buffer,
+                &self.ln_freqs,
+                stereo_mode_idx,
+                chain_for_channel(channel_idx),
+                num_channels,
+            );
         }
 
         match params.threshold.mode.value() {
@@ -955,10 +952,31 @@ impl CompressorBank {
     /// Set the sidechain frequency spectrum magnitudes just before a [`process()`][Self::process()]
     /// call. These will be multiplied with the existing compressor thresholds and knee values to
     /// get the effective values for use with sidechaining.
-    pub fn process_sidechain(&mut self, sc_buffer: &[Complex32], channel_idx: usize) {
+    pub fn process_sidechain(
+        &mut self,
+        sc_buffer: &[Complex32],
+        channel_idx: usize,
+        params: &SpectralCompressorParams,
+    ) {
         nih_debug_assert_eq!(sc_buffer.len(), self.ln_freqs.len());
 
         self.update_sidechain_spectra(sc_buffer, channel_idx);
+
+        // Captured from the bins here rather than from the magnitudes stored just above, because
+        // deriving the other stereo mode needs the phase those have thrown away. This is also the
+        // only place the sidechain's complex spectrum exists.
+        if self.capture.is_active()
+            && params.threshold.capture.source.value() == CaptureSource::Sidechain
+        {
+            let stereo_mode_idx = params.global.stereo_mode.value().to_index();
+            self.capture.push_bins(
+                sc_buffer,
+                &self.ln_freqs,
+                stereo_mode_idx,
+                chain_for_channel(channel_idx),
+                self.sidechain_spectrum_magnitudes.len(),
+            );
+        }
     }
 
     /// Update the envelope followers based on the bin magnitudes.
