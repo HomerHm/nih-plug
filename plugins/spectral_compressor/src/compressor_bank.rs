@@ -20,6 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::analyzer::AnalyzerData;
+use crate::capture::{
+    smooth_into, CaptureBank, CaptureBlend, CaptureParams, CaptureSource, CAPTURE_GRID_LEN,
+};
 use crate::curve::{Curve, CurveParams};
 use crate::eq_curve::{power_to_db, CompressorDirection, EqBankParams, EqCurve, EqCurveParams};
 use crate::SpectralCompressorParams;
@@ -118,6 +121,13 @@ pub struct CompressorBank {
     /// coefficients for the envelope followers in the process function.
     sample_rate: f32,
 
+    /// The captured sound signature, and the accumulator that fills it. Lives here because it
+    /// needs the same bin magnitudes and frequencies everything else in this file works from.
+    pub capture: CaptureBank,
+    /// One chain's captured curve after smoothing, rebuilt just before the threshold arrays that
+    /// use it. Kept here so smoothing never allocates on the audio thread.
+    capture_smoothed: Vec<f32>,
+
     /// The input data for the spectrum analyzer. Stores both the spectrum analyzer values and the
     /// current gain reduction. Used to draw the spectrum analyzer and gain reduction display in the
     /// editor.
@@ -161,6 +171,10 @@ pub struct ThresholdParams {
     /// so editing one silently left the other behind.
     #[nested(group = "Threshold EQ")]
     pub eq: EqBankParams,
+
+    /// The captured sound signature, and how much of it stands in for the polynomial's shape.
+    #[nested(group = "Capture")]
+    pub capture: CaptureParams,
 }
 
 /// The type of threshold to use.
@@ -373,6 +387,7 @@ impl ThresholdParams {
         });
 
         let set_update_both_thresholds_for_chains = set_update_both_thresholds.clone();
+        let set_update_both_thresholds_for_capture = set_update_both_thresholds.clone();
         // A chain's own curve only affects that compressor, so it doesn't need to dirty the other
         let set_update_downwards_thresholds: Arc<dyn Fn(f32) + Send + Sync> = Arc::new({
             let should_update_downwards_thresholds =
@@ -435,6 +450,10 @@ impl ThresholdParams {
                 )
             }),
             eq: EqBankParams::new("", set_update_both_thresholds_for_chains),
+            capture: CaptureParams::new(
+                compressor_bank.capture.shared(),
+                set_update_both_thresholds_for_capture,
+            ),
         }
     }
 
@@ -596,6 +615,9 @@ impl CompressorBank {
             ],
             window_size: 0,
             sample_rate: 1.0,
+
+            capture: CaptureBank::new(),
+            capture_smoothed: vec![0.0; CAPTURE_GRID_LEN],
 
             analyzer_input_data,
         }
@@ -777,7 +799,31 @@ impl CompressorBank {
             }
         }
 
+        // Housekeeping first, so that stopping a capture is reflected in the curves this same block
+        let stereo_mode_idx = params.global.stereo_mode.value().to_index();
+        self.capture.poll(stereo_mode_idx);
+
         self.update_if_needed(params);
+
+        // Both chains are always captured, so switching between left/right and mid/side later on
+        // never throws a curve away. This runs before the match below because that is where the
+        // bins get scaled: what belongs in a capture is the input, not the compressed output.
+        if self.capture.is_active() {
+            let chain_idx = chain_for_channel(channel_idx);
+            match params.threshold.capture.source.value() {
+                CaptureSource::Main => {
+                    self.capture
+                        .push_bins(buffer, &self.ln_freqs, stereo_mode_idx, chain_idx)
+                }
+                CaptureSource::Sidechain => self.capture.push_frame(
+                    &self.sidechain_spectrum_magnitudes[channel_idx],
+                    &self.ln_freqs,
+                    stereo_mode_idx,
+                    chain_idx,
+                ),
+            }
+        }
+
         match params.threshold.mode.value() {
             ThresholdMode::Internal => {
                 self.update_envelopes(buffer, channel_idx, params, overlap_times);
@@ -1250,6 +1296,7 @@ impl CompressorBank {
         thresholds_db: &mut [f32],
         curve_params: &CurveParams,
         eq_params: &EqCurveParams,
+        capture: Option<&CaptureBlend>,
         direction: CompressorDirection,
         chain_idx: usize,
         intercept_db: f32,
@@ -1257,12 +1304,22 @@ impl CompressorBank {
         let curve = Curve::new(curve_params);
         let eq_curve = EqCurve::new(eq_params, direction, chain_idx);
 
+        // A capture replaces the polynomial's shape rather than adding to it, but it comes back as
+        // a difference from what the polynomial says. Adding a zero is exact, so a curve with no
+        // capture in play is bit for bit what it was before any of this existed.
+        let capture_delta = |ln_freq: f32, polynomial_db: f32| match capture {
+            Some(capture) => capture.delta_ln(ln_freq, polynomial_db),
+            None => 0.0,
+        };
+
         // Skipping the scratch buffer entirely when every node is off keeps the common case as
         // cheap as it was before the nodes existed
         if eq_curve.is_empty() {
             for (ln_freq, threshold_db) in ln_freqs.iter().zip(thresholds_db.iter_mut()) {
+                let polynomial_db = curve.evaluate_ln(*ln_freq);
                 *threshold_db =
-                    (curve.evaluate_ln(*ln_freq) + intercept_db).max(util::MINUS_INFINITY_DB);
+                    (polynomial_db + capture_delta(*ln_freq, polynomial_db) + intercept_db)
+                        .max(util::MINUS_INFINITY_DB);
             }
             return;
         }
@@ -1274,14 +1331,79 @@ impl CompressorBank {
             .zip(eq_power.iter())
             .zip(thresholds_db.iter_mut())
         {
-            *threshold_db = (curve.evaluate_ln(*ln_freq) + power_to_db(*eq_power) + intercept_db)
+            let polynomial_db = curve.evaluate_ln(*ln_freq);
+            *threshold_db = (polynomial_db
+                + capture_delta(*ln_freq, polynomial_db)
+                + power_to_db(*eq_power)
+                + intercept_db)
                 .max(util::MINUS_INFINITY_DB);
         }
+    }
+
+    /// Smooth the captured curve for `chain_idx` into [`Self::capture_smoothed`], and report
+    /// whether there is one to blend in at all.
+    ///
+    /// Smoothing happens here rather than at capture time so that changing it does not mean
+    /// capturing all over again.
+    fn prepare_capture_curve(
+        &mut self,
+        params: &SpectralCompressorParams,
+        chain_idx: usize,
+    ) -> bool {
+        if params.threshold.capture.amount.value() <= 0.0 {
+            return false;
+        }
+
+        let stereo_mode_idx = params.global.stereo_mode.value().to_index();
+        match self.capture.curve(stereo_mode_idx, chain_idx) {
+            Some(raw) => {
+                smooth_into(
+                    raw,
+                    &mut self.capture_smoothed,
+                    params.threshold.capture.smoothing_octaves.value(),
+                );
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Build the blend for one chain's threshold curve. [`Self::prepare_capture_curve()`] must
+    /// have been called for the same chain first, and must have returned `true`.
+    ///
+    /// Takes the smoothed buffer rather than `&self` so that the threshold array it feeds can be
+    /// borrowed mutably at the same time.
+    fn capture_blend<'a>(
+        capture_smoothed: &'a [f32],
+        params: &SpectralCompressorParams,
+        curve_params: &CurveParams,
+    ) -> CaptureBlend<'a> {
+        CaptureBlend::new(
+            capture_smoothed,
+            curve_params.center_frequency.ln(),
+            curve_params.intercept,
+            params.threshold.capture.amount.value(),
+            params.threshold.capture.low_frequency.value(),
+            params.threshold.capture.high_frequency.value(),
+        )
     }
 
     /// Update the compressors if needed. This is called just before processing, and the compressors
     /// are updated in accordance to the atomic flags set on this struct.
     fn update_if_needed(&mut self, params: &SpectralCompressorParams) {
+        // A capture that grew, got cleared, or arrived with a preset changes the base shape of
+        // both curves, and the knee parabolas are built from the thresholds so they follow
+        if self.capture.take_dirty() {
+            self.should_update_downwards_thresholds
+                .store(true, Ordering::SeqCst);
+            self.should_update_upwards_thresholds
+                .store(true, Ordering::SeqCst);
+            self.should_update_downwards_knee_parabolas
+                .store(true, Ordering::SeqCst);
+            self.should_update_upwards_knee_parabolas
+                .store(true, Ordering::SeqCst);
+        }
+
         // NOTE: The threshold curves are polynomials in log-log (decibels-octaves) space. They're
         //       built inside of the branches below rather than up here because `Curve::new()`
         //       takes a logarithm, and in the common case neither array needs recomputing at all.
@@ -1291,13 +1413,26 @@ impl CompressorBank {
             .is_ok()
         {
             for (chain_idx, chain) in params.threshold.chains.iter().enumerate() {
+                let has_capture = self.prepare_capture_curve(params, chain_idx);
+                let curve_params = params.threshold.curve_params(&chain.downwards);
+                let blend = if has_capture {
+                    Some(Self::capture_blend(
+                        &self.capture_smoothed,
+                        params,
+                        &curve_params,
+                    ))
+                } else {
+                    None
+                };
+
                 Self::recompute_thresholds(
                     &self.freqs,
                     &self.ln_freqs,
                     &mut self.eq_power,
                     &mut self.downwards_thresholds_db[chain_idx],
-                    &params.threshold.curve_params(&chain.downwards),
+                    &curve_params,
                     &params.threshold.eq.snapshot(),
+                    blend.as_ref(),
                     CompressorDirection::Downwards,
                     chain_idx,
                     chain.downwards.threshold_offset_db.value(),
@@ -1311,13 +1446,26 @@ impl CompressorBank {
             .is_ok()
         {
             for (chain_idx, chain) in params.threshold.chains.iter().enumerate() {
+                let has_capture = self.prepare_capture_curve(params, chain_idx);
+                let curve_params = params.threshold.curve_params(&chain.upwards);
+                let blend = if has_capture {
+                    Some(Self::capture_blend(
+                        &self.capture_smoothed,
+                        params,
+                        &curve_params,
+                    ))
+                } else {
+                    None
+                };
+
                 Self::recompute_thresholds(
                     &self.freqs,
                     &self.ln_freqs,
                     &mut self.eq_power,
                     &mut self.upwards_thresholds_db[chain_idx],
-                    &params.threshold.curve_params(&chain.upwards),
+                    &curve_params,
                     &params.threshold.eq.snapshot(),
+                    blend.as_ref(),
                     CompressorDirection::Upwards,
                     chain_idx,
                     chain.upwards.threshold_offset_db.value(),

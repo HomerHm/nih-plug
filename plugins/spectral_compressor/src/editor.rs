@@ -20,11 +20,13 @@ use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use self::analyzer::{format_frequency, frequency_to_t, Analyzer, FREQUENCY_TICKS};
 use self::param_link::{param_ptr_by_id, param_ptr_pairs, ParamLink, ParamLinkEvent};
 use crate::analyzer::AnalyzerData;
+use crate::capture::SharedCaptureState;
 use crate::compressor_bank::{ThresholdCurveParams, NUM_CHAINS};
 use crate::eq_curve::{CompressorDirection, EqNodeChannel, EqNodeParams, EqNodeType, MAX_EQ_NODES};
 use crate::{SoloMode, StereoMode};
@@ -177,6 +179,14 @@ pub struct Data {
     /// The node the inspector below the analyzer is editing. There is one shared bank of nodes,
     /// each carrying which chain it belongs to, so an index identifies a node on its own.
     pub(crate) selected_node: Option<usize>,
+
+    /// Raised while the user holds capture, and to throw the current stereo mode's curves away.
+    /// Both are actions rather than settings, so like [`Self::solo`] they are not parameters.
+    pub(crate) capture_active: Arc<AtomicBool>,
+    pub(crate) capture_clear: Arc<AtomicBool>,
+    /// The captured curves, so the analyzer can draw them and the controls can tell an empty slot
+    /// from a filled one.
+    pub(crate) capture_state: SharedCaptureState,
 }
 
 impl Model for Data {

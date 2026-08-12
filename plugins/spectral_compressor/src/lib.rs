@@ -22,11 +22,12 @@ use nih_plug::prelude::*;
 use nih_plug_vizia::ViziaState;
 use realfft::num_complex::Complex32;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use triple_buffer::TripleBuffer;
 
 mod analyzer;
+mod capture;
 mod compressor_bank;
 mod curve;
 mod dry_wet_mixer;
@@ -86,6 +87,12 @@ pub struct SpectralCompressor {
     /// Which chain is being soloed, set from the editor. Not part of the parameters, so it is
     /// never persisted.
     solo: Arc<AtomicCell<SoloMode>>,
+
+    /// Raised by the editor while the user holds capture, and to throw the current stereo mode's
+    /// curves away. Like `solo`, these are actions rather than settings, so they are deliberately
+    /// not parameters: a project that reopened mid-capture would be a nasty surprise.
+    capture_active: Arc<AtomicBool>,
+    capture_clear: Arc<AtomicBool>,
 }
 
 /// An FFT plan for a specific window size, all of which will be precomputed during initilaization.
@@ -203,6 +210,9 @@ impl Default for SpectralCompressor {
         // this object that causes the compressor thresholds and ratios to be recalcualted
         let compressor_bank =
             compressor_bank::CompressorBank::new(analyzer_input_data, 2, MAX_WINDOW_SIZE);
+        // Taken before the bank is moved into the struct below; the editor drives these
+        let compressor_bank_capture_active = compressor_bank.capture.active_flag();
+        let compressor_bank_capture_clear = compressor_bank.capture.clear_flag();
 
         SpectralCompressor {
             params: Arc::new(SpectralCompressorParams::new(&compressor_bank)),
@@ -228,6 +238,9 @@ impl Default for SpectralCompressor {
 
             analyzer_output_data: Arc::new(Mutex::new(analyzer_output_data)),
             solo: Arc::new(AtomicCell::new(SoloMode::Off)),
+
+            capture_active: compressor_bank_capture_active,
+            capture_clear: compressor_bank_capture_clear,
         }
     }
 }
@@ -385,6 +398,9 @@ impl Plugin for SpectralCompressor {
                 chain_mode: self.params.chain_mode.load(),
                 chain_mode_cell: self.params.chain_mode.clone(),
                 solo: self.solo.clone(),
+                capture_active: self.capture_active.clone(),
+                capture_clear: self.capture_clear.clone(),
+                capture_state: self.params.threshold.capture.state.clone(),
                 selected_node: None,
             },
         )
@@ -503,11 +519,21 @@ impl Plugin for SpectralCompressor {
             convert_mid_side(buffer);
         }
 
+        // The sidechain STFT normally only runs for the modes that need it. Capturing from the
+        // sidechain needs it too, and without this the capture would quietly record silence --
+        // which is the workflow that makes matching another track practical in the first place.
+        let capturing_sidechain = self.compressor_bank.capture.is_active()
+            && self.params.threshold.capture.source.value() == capture::CaptureSource::Sidechain;
+        let needs_sidechain = capturing_sidechain
+            || !matches!(
+                self.params.threshold.mode.value(),
+                compressor_bank::ThresholdMode::Internal
+            );
+
         match self.params.threshold.mode.value() {
-            compressor_bank::ThresholdMode::Internal => self.stft.process_overlap_add(
-                buffer,
-                overlap_times,
-                |channel_idx, real_fft_buffer| {
+            compressor_bank::ThresholdMode::Internal if !needs_sidechain => self
+                .stft
+                .process_overlap_add(buffer, overlap_times, |channel_idx, real_fft_buffer| {
                     process_stft_main(
                         channel_idx,
                         real_fft_buffer,
@@ -521,43 +547,39 @@ impl Plugin for SpectralCompressor {
                         overlap_times,
                         first_non_dc_bin_idx,
                     )
+                }),
+            _ => self.stft.process_overlap_add_sidechain(
+                buffer,
+                [&aux.inputs[0]],
+                overlap_times,
+                |channel_idx, sidechain_buffer_idx, real_fft_buffer| {
+                    if sidechain_buffer_idx.is_some() {
+                        process_stft_sidechain(
+                            channel_idx,
+                            real_fft_buffer,
+                            &mut self.complex_fft_buffer,
+                            fft_plan,
+                            &self.window_function,
+                            &mut self.compressor_bank,
+                            input_gain,
+                        );
+                    } else {
+                        process_stft_main(
+                            channel_idx,
+                            real_fft_buffer,
+                            &mut self.complex_fft_buffer,
+                            fft_plan,
+                            &self.window_function,
+                            &self.params,
+                            &mut self.compressor_bank,
+                            input_gain,
+                            output_gain,
+                            overlap_times,
+                            first_non_dc_bin_idx,
+                        )
+                    }
                 },
             ),
-            compressor_bank::ThresholdMode::SidechainMatch
-            | compressor_bank::ThresholdMode::SidechainCompress => {
-                self.stft.process_overlap_add_sidechain(
-                    buffer,
-                    [&aux.inputs[0]],
-                    overlap_times,
-                    |channel_idx, sidechain_buffer_idx, real_fft_buffer| {
-                        if sidechain_buffer_idx.is_some() {
-                            process_stft_sidechain(
-                                channel_idx,
-                                real_fft_buffer,
-                                &mut self.complex_fft_buffer,
-                                fft_plan,
-                                &self.window_function,
-                                &mut self.compressor_bank,
-                                input_gain,
-                            );
-                        } else {
-                            process_stft_main(
-                                channel_idx,
-                                real_fft_buffer,
-                                &mut self.complex_fft_buffer,
-                                fft_plan,
-                                &self.window_function,
-                                &self.params,
-                                &mut self.compressor_bank,
-                                input_gain,
-                                output_gain,
-                                overlap_times,
-                                first_non_dc_bin_idx,
-                            )
-                        }
-                    },
-                )
-            }
         }
 
         if mid_side {
