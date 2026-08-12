@@ -226,10 +226,24 @@ where
         // Both lines are collected, so a handle on the one that isn't focused can still be found.
         // A node applying to both gets a handle on each; they are the same node, so dragging
         // either moves both.
+        // A handle sits on the curve it belongs to, so it has to be placed on the same curve that
+        // gets drawn -- capture and all. Leaving the capture out left every handle floating off the
+        // line, and since hit testing reads these positions too, clicking one missed by the same
+        // distance.
+        let capture_smoothed = self.smoothed_capture();
+
         for direction in [CompressorDirection::Upwards, CompressorDirection::Downwards] {
             let (curve_params, eq_params, offset_db) =
                 curve_inputs(&self.params, chain_idx, direction);
             let curve = Curve::new(&curve_params);
+            let capture_blend = capture_smoothed.as_deref().map(|smoothed| {
+                capture_blend_for(
+                    &self.params,
+                    &curve_params,
+                    smoothed,
+                    self.params.threshold.capture.amount.value(),
+                )
+            });
 
             for (index, node) in eq_params.nodes.iter().enumerate() {
                 // Linked means one curve, and `merge_chains()` sees to it that every node really
@@ -245,7 +259,12 @@ where
                     continue;
                 }
 
-                let y_db = curve.evaluate_ln(node.center_frequency.ln())
+                let ln_freq = node.center_frequency.ln();
+                let capture_delta_db = capture_blend
+                    .as_ref()
+                    .map_or(0.0, |blend| blend.delta_ln(ln_freq));
+                let y_db = curve.evaluate_ln(ln_freq)
+                    + capture_delta_db
                     + node.handle_offset_db()
                     + offset_db;
 
@@ -667,11 +686,12 @@ where
         let bounds = cx.bounds();
         let num_points = 100.min(bounds.w.ceil() as usize);
 
-        // Pinned against the curve the graph is otherwise built around, so it lands where the
-        // threshold would if the amount were all the way up
+        // Drawn at a full amount whatever the amount parameter says, so it answers "where would
+        // this go if I pushed it all the way" even while the amount is turned down for an A/B
         let (curve_params, _, offset_db) =
             curve_inputs(&self.params, chain_idx, CompressorDirection::Downwards);
-        let curve = CaptureCurve::new(capture_smoothed, curve_params.center_frequency.ln());
+        let curve = Curve::new(&curve_params);
+        let blend = capture_blend_for(&self.params, &curve_params, capture_smoothed, 1.0);
 
         let paint = vg::Paint::color(CAPTURE_CURVE_COLOR).with_line_width(cx.scale_factor() * 2.0);
         let mut path = vg::Path::new();
@@ -679,7 +699,7 @@ where
             let x_t = i as f32 / (num_points - 1) as f32;
             let ln_freq = LN_FREQ_RANGE_START_HZ + (LN_FREQ_RANGE * x_t);
 
-            let y_db = curve_params.intercept + curve.evaluate_ln(ln_freq) + offset_db;
+            let y_db = curve.evaluate_ln(ln_freq) + blend.delta_ln(ln_freq) + offset_db;
             let y_t = db_to_unclamped_t(y_db);
 
             let physical_x_pos = bounds.x + (bounds.w * x_t);
@@ -720,8 +740,14 @@ where
             let eq_curve = EqCurve::new(&eq_params, direction, chain_idx);
             // The compressor bank folds the capture into its thresholds, so leaving it out here
             // would draw a curve that no longer matches the one being heard
-            let capture_blend = capture_smoothed
-                .map(|smoothed| capture_blend_for(&self.params, &curve_params, smoothed));
+            let capture_blend = capture_smoothed.map(|smoothed| {
+                capture_blend_for(
+                    &self.params,
+                    &curve_params,
+                    smoothed,
+                    self.params.threshold.capture.amount.value(),
+                )
+            });
 
             let color = match direction {
                 CompressorDirection::Upwards => UPWARDS_THRESHOLD_CURVE_COLOR,
@@ -741,7 +767,7 @@ where
                 let polynomial_db = curve.evaluate_ln(ln_freq);
                 let capture_delta_db = capture_blend
                     .as_ref()
-                    .map_or(0.0, |blend| blend.delta_ln(ln_freq, polynomial_db));
+                    .map_or(0.0, |blend| blend.delta_ln(ln_freq));
                 let y_db = polynomial_db
                     + capture_delta_db
                     + eq_curve.evaluate_db(ln_freq.exp())
@@ -1043,12 +1069,13 @@ fn capture_blend_for<'a>(
     params: &SpectralCompressorParams,
     curve_params: &CurveParams,
     capture_smoothed: &'a [f32],
+    amount: f32,
 ) -> CaptureBlend<'a> {
     CaptureBlend::new(
         capture_smoothed,
         curve_params.center_frequency.ln(),
-        curve_params.intercept,
-        params.threshold.capture.amount.value(),
+        params.threshold.baseline_slope(),
+        amount,
         params.threshold.capture.low_frequency.value(),
         params.threshold.capture.high_frequency.value(),
     )

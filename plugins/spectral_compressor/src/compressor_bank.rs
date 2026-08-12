@@ -32,6 +32,14 @@ use crate::SpectralCompressorParams;
 const DOWNWARDS_NAME_PREFIX: &str = "Downwards";
 const UPWARDS_NAME_PREFIX: &str = "Upwards";
 
+/// How much the threshold curve tilts down by default, as a slope in the log/log domain.
+///
+/// This is what makes the default settings compress a typical mix evenly: music falls off at
+/// roughly this rate, so a curve that follows it sits at a constant distance above the audio. It is
+/// an assumption about what music looks like, which is exactly what a sound signature capture
+/// replaces -- see [`ThresholdParams::baseline_slope()`].
+const PINK_NOISE_SLOPE: f32 = -3.0;
+
 /// The envelopes are initialized to the RMS value of a -24 dB sine wave to make sure extreme upwards
 /// compression doesn't cause pops when switching between window sizes and when deactivating and
 /// reactivating the plugin.
@@ -464,16 +472,24 @@ impl ThresholdParams {
         CurveParams {
             intercept: self.threshold_db.value(),
             center_frequency: curve.center_frequency.value(),
-            // The cheeky 3 additional dB/octave attenuation is to match pink noise with the
-            // default settings. When using sidechaining we explicitly don't want this because
-            // the curve should be a flat offset to the sidechain input at the default settings.
-            slope: match self.mode.value() {
-                ThresholdMode::Internal => curve.curve_slope.value() - 3.0,
-                ThresholdMode::SidechainMatch | ThresholdMode::SidechainCompress => {
-                    curve.curve_slope.value()
-                }
-            },
+            // The cheeky additional attenuation is to match pink noise with the default settings.
+            // When using sidechaining we explicitly don't want this because the curve should be a
+            // flat offset to the sidechain input at the default settings.
+            slope: curve.curve_slope.value() + self.baseline_slope(),
             curve: curve.curve_curve.value(),
+        }
+    }
+
+    /// The slope of the shape the threshold curve assumes the audio has, which is what a capture
+    /// stands in for.
+    ///
+    /// Broken out from [`Self::curve_params()`] rather than folded into it because the capture has
+    /// to replace *only* this part. Crossfading against the whole polynomial would take the user's
+    /// own slope and curve down with it, leaving two controls that silently did nothing.
+    pub fn baseline_slope(&self) -> f32 {
+        match self.mode.value() {
+            ThresholdMode::Internal => PINK_NOISE_SLOPE,
+            ThresholdMode::SidechainMatch | ThresholdMode::SidechainCompress => 0.0,
         }
     }
 }
@@ -1304,11 +1320,11 @@ impl CompressorBank {
         let curve = Curve::new(curve_params);
         let eq_curve = EqCurve::new(eq_params, direction, chain_idx);
 
-        // A capture replaces the polynomial's shape rather than adding to it, but it comes back as
-        // a difference from what the polynomial says. Adding a zero is exact, so a curve with no
+        // A capture replaces the baseline tilt the curve assumes, leaving the slope, the curve, and
+        // every node to apply on top as they always did. Adding a zero is exact, so a curve with no
         // capture in play is bit for bit what it was before any of this existed.
-        let capture_delta = |ln_freq: f32, polynomial_db: f32| match capture {
-            Some(capture) => capture.delta_ln(ln_freq, polynomial_db),
+        let capture_delta = |ln_freq: f32| match capture {
+            Some(capture) => capture.delta_ln(ln_freq),
             None => 0.0,
         };
 
@@ -1317,9 +1333,8 @@ impl CompressorBank {
         if eq_curve.is_empty() {
             for (ln_freq, threshold_db) in ln_freqs.iter().zip(thresholds_db.iter_mut()) {
                 let polynomial_db = curve.evaluate_ln(*ln_freq);
-                *threshold_db =
-                    (polynomial_db + capture_delta(*ln_freq, polynomial_db) + intercept_db)
-                        .max(util::MINUS_INFINITY_DB);
+                *threshold_db = (polynomial_db + capture_delta(*ln_freq) + intercept_db)
+                    .max(util::MINUS_INFINITY_DB);
             }
             return;
         }
@@ -1332,11 +1347,9 @@ impl CompressorBank {
             .zip(thresholds_db.iter_mut())
         {
             let polynomial_db = curve.evaluate_ln(*ln_freq);
-            *threshold_db = (polynomial_db
-                + capture_delta(*ln_freq, polynomial_db)
-                + power_to_db(*eq_power)
-                + intercept_db)
-                .max(util::MINUS_INFINITY_DB);
+            *threshold_db =
+                (polynomial_db + capture_delta(*ln_freq) + power_to_db(*eq_power) + intercept_db)
+                    .max(util::MINUS_INFINITY_DB);
         }
     }
 
@@ -1381,7 +1394,7 @@ impl CompressorBank {
         CaptureBlend::new(
             capture_smoothed,
             curve_params.center_frequency.ln(),
-            curve_params.intercept,
+            params.threshold.baseline_slope(),
             params.threshold.capture.amount.value(),
             params.threshold.capture.low_frequency.value(),
             params.threshold.capture.high_frequency.value(),

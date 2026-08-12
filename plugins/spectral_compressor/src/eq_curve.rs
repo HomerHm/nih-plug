@@ -390,9 +390,19 @@ impl PreparedNode {
                     / ((denominator_real * denominator_real) + shared)
             }
             PreparedShape::LowCut { order } => {
-                let omega_pow = omega_squared.powi(order);
-                omega_pow / (1.0 + omega_pow)
+                // Written as a reciprocal rather than as the equivalent `x / (1 + x)`, because that
+                // form has to compute `x = (freq / center)^(2 * order)` first. At 48 dB/octave that
+                // is a sixteenth power, which overflows an `f32` once the ratio passes 256 -- only
+                // about ninety hertz below the top of the spectrum at common sample rates -- and
+                // `inf / (1 + inf)` is NaN rather than the 1.0 the limit is heading towards. That
+                // NaN then spread through the accumulated power and flattened the whole curve.
+                //
+                // This way the large value sits in the denominator, where overflowing saturates to
+                // the 0.0 that a low cut far below its corner frequency should give anyway.
+                (1.0 + omega_squared.powi(-order)).recip()
             }
+            // The high cut needs no such care: its large value is already in the denominator, so
+            // it saturates to the correct 0.0 well above the corner frequency.
             PreparedShape::HighCut { order } => (1.0 + omega_squared.powi(order)).recip(),
         }
     }
@@ -624,6 +634,59 @@ mod tests {
             gain_db,
             q: 1.0,
         }
+    }
+
+    /// A cut node of `node_type` at `center_frequency`.
+    fn cut(node_type: EqNodeType, center_frequency: f32) -> EqNode {
+        EqNode {
+            node_type,
+            target: EqNodeTarget::Both,
+            channel: EqNodeChannel::Both,
+            center_frequency,
+            gain_db: 0.0,
+            q: 1.0,
+        }
+    }
+
+    /// A steep low cut placed low enough that the frequency ratio at the top of the spectrum passes
+    /// 256, which is where a sixteenth power stops fitting in an `f32`.
+    ///
+    /// The overflow used to reach the curve as a NaN, which spread through the accumulated power
+    /// and cut everything above it off as if by a brick wall. Well above its corner a low cut has
+    /// to be transparent, whatever the arithmetic does on the way there.
+    #[test]
+    fn steep_low_cuts_stay_transparent_above_their_corner() {
+        for corner_hz in [20.0, 40.0, 60.0, 88.0, 200.0] {
+            for node_type in [
+                EqNodeType::LowCut12,
+                EqNodeType::LowCut24,
+                EqNodeType::LowCut48,
+            ] {
+                for frequency in [1000.0, 8000.0, 20_000.0] {
+                    let db = node_db(cut(node_type, corner_hz), frequency);
+                    assert!(
+                        db.is_finite(),
+                        "{node_type:?} at {corner_hz} Hz evaluated to {db} at {frequency} Hz"
+                    );
+                    assert!(
+                        db.abs() < 0.1,
+                        "{node_type:?} at {corner_hz} Hz should pass {frequency} Hz untouched, got {db} dB"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The other end of the same expression: far below its corner the cut still has to bite, and
+    /// underflowing towards zero power is the right way to run out of range.
+    #[test]
+    fn steep_low_cuts_still_cut_below_their_corner() {
+        let db = node_db(cut(EqNodeType::LowCut48, 88.0), 22.0);
+        assert!(db.is_finite(), "evaluated to {db}");
+        assert!(
+            db < -60.0,
+            "two octaves below a 48 dB/oct corner, got {db} dB"
+        );
     }
 
     #[test]

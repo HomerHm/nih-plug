@@ -822,14 +822,21 @@ const CAPTURE_FADE_OCTAVES: f32 = 1.0;
 
 /// Everything needed to blend one chain's captured curve into one threshold curve.
 ///
-/// The capture stands in for the polynomial's *shape* rather than adding to it. Adding would
-/// double up the tilt — matching a reference that is already close to pink noise would land at
-/// about -6 dB/octave against a baseline that is already at -3 — so what happens here is a
-/// crossfade between the two shapes, with the level left alone.
+/// What the capture stands in for is the *assumption* built into the threshold curve, not the
+/// user's own shaping of it. The curve is tilted by a few decibels per octave by default because
+/// that is roughly what music looks like; a capture is a measurement of what this particular music
+/// looks like, so it replaces exactly that and nothing else. The threshold slope, curve, and every
+/// EQ node keep applying on top, unchanged.
+///
+/// It has to be a crossfade rather than an addition. Adding would double the tilt: a reference
+/// already shaped like the assumed baseline would come out at twice its slope, so matching
+/// something pink against a pink baseline would not give back something pink.
 pub struct CaptureBlend<'a> {
     curve: CaptureCurve<'a>,
-    /// The polynomial's intercept, subtracted to get at its shape on its own.
-    polynomial_intercept_db: f32,
+    /// Where both shapes are pinned to zero, so they can stand in for each other.
+    ln_center_frequency: f32,
+    /// The slope of the baseline being replaced, in the same units as [`CurveParams::slope`].
+    baseline_slope: f32,
     amount: f32,
 
     /// The band the capture applies over, in nepers, along with where its fades reach zero.
@@ -845,7 +852,7 @@ impl<'a> CaptureBlend<'a> {
     pub fn new(
         grid_db: &'a [f32],
         ln_center_frequency: f32,
-        polynomial_intercept_db: f32,
+        baseline_slope: f32,
         amount: f32,
         low_frequency: f32,
         high_frequency: f32,
@@ -856,7 +863,8 @@ impl<'a> CaptureBlend<'a> {
 
         Self {
             curve: CaptureCurve::new(grid_db, ln_center_frequency),
-            polynomial_intercept_db,
+            ln_center_frequency,
+            baseline_slope,
             amount,
             ln_low,
             ln_low_zero: ln_low - fade,
@@ -880,21 +888,22 @@ impl<'a> CaptureBlend<'a> {
         below.min(above)
     }
 
-    /// How far the capture moves the threshold at this frequency, given what the polynomial says
-    /// there.
+    /// How far the capture moves the threshold at this frequency.
     ///
     /// Returning a delta rather than a blended value is deliberate: adding a zero is exact in
     /// floating point, so a curve with no capture in play comes out bit for bit the same as it did
     /// before this feature existed.
     #[inline]
-    pub fn delta_ln(&self, ln_freq: f32, polynomial_db: f32) -> f32 {
+    pub fn delta_ln(&self, ln_freq: f32) -> f32 {
         let weight = self.amount * self.weight_ln(ln_freq);
         if weight <= 0.0 {
             return 0.0;
         }
 
-        let polynomial_shape_db = polynomial_db - self.polynomial_intercept_db;
-        (self.curve.evaluate_ln(ln_freq) - polynomial_shape_db) * weight
+        // Both shapes read zero at the center frequency, which is what lets one stand in for the
+        // other without moving the threshold's overall level
+        let baseline_db = self.baseline_slope * (ln_freq - self.ln_center_frequency);
+        (self.curve.evaluate_ln(ln_freq) - baseline_db) * weight
     }
 }
 
@@ -1154,68 +1163,93 @@ mod tests {
         assert_eq!(seen.len(), NUM_STEREO_MODES * NUM_CHAINS);
     }
 
+    /// The slope the threshold curve assumes the audio has, matching `PINK_NOISE_SLOPE` in the
+    /// compressor bank. Written out here so these tests do not depend on that module.
+    const BASELINE: f32 = -3.0;
+
+    const LN_CENTER: f32 = 6.907_755_3; // 1000.0f32.ln()
+
     /// A capture curve that falls by `slope_db_per_neper` around one kilohertz, offset by an
     /// arbitrary level to prove the level gets normalized away.
     fn sloped_grid(slope_db_per_neper: f32, level_db: f32) -> Vec<f32> {
-        let ln_center = 1000.0f32.ln();
         (0..CAPTURE_GRID_LEN)
-            .map(|idx| (slope_db_per_neper * (grid_ln_freq(idx) - ln_center)) + level_db)
+            .map(|idx| (slope_db_per_neper * (grid_ln_freq(idx) - LN_CENTER)) + level_db)
             .collect()
     }
 
-    fn full_range_blend(grid: &[f32], intercept_db: f32, amount: f32) -> CaptureBlend<'_> {
+    fn full_range_blend(grid: &[f32], baseline_slope: f32, amount: f32) -> CaptureBlend<'_> {
         CaptureBlend::new(
             grid,
-            1000.0f32.ln(),
-            intercept_db,
+            LN_CENTER,
+            baseline_slope,
             amount,
             CAPTURE_MIN_HZ,
             CAPTURE_MAX_HZ,
         )
     }
 
-    /// The reason the capture crossfades with the polynomial's shape instead of being added to it.
+    /// The reason the capture crossfades with the assumed baseline instead of being added to it.
     /// Adding would land a reference that already looks like the baseline at twice the tilt, so
-    /// matching something pink against a pink baseline would come out at -6 dB/octave.
+    /// matching something pink against a pink baseline would not come back pink.
     #[test]
     fn matching_a_reference_shaped_like_the_baseline_changes_nothing() {
-        let intercept_db = -12.0;
-        let ln_center = 1000.0f32.ln();
-        let slope = -3.0;
-        // The capture sits forty decibels away from the polynomial, which pinning has to remove
-        let grid = sloped_grid(slope, 40.0);
-        let blend = full_range_blend(&grid, intercept_db, 1.0);
+        // The capture sits forty decibels away from the baseline, which pinning has to remove
+        let grid = sloped_grid(BASELINE, 40.0);
+        let blend = full_range_blend(&grid, BASELINE, 1.0);
 
-        for hz in [50.0f32, 200.0, 1000.0, 5000.0, 15000.0] {
-            let ln_freq = hz.ln();
-            let polynomial_db = intercept_db + (slope * (ln_freq - ln_center));
-            let blended = polynomial_db + blend.delta_ln(ln_freq, polynomial_db);
-
+        for hz in [50.0f32, 200.0, 1000.0, 5000.0, 15_000.0] {
+            let delta = blend.delta_ln(hz.ln());
             assert!(
-                (blended - polynomial_db).abs() < 0.05,
-                "at {hz} Hz the blend moved {polynomial_db} to {blended}"
+                delta.abs() < 0.05,
+                "at {hz} Hz the blend moved it by {delta}"
             );
         }
     }
 
-    /// Fully applied, the shape comes from the capture and the level still comes from the
-    /// polynomial's intercept.
+    /// Fully applied, the assumed tilt is gone and the measured one is in its place.
     #[test]
-    fn a_full_blend_takes_the_shape_from_the_capture_and_the_level_from_the_polynomial() {
-        let intercept_db = -12.0;
-        let ln_center = 1000.0f32.ln();
+    fn a_full_blend_swaps_the_assumed_shape_for_the_captured_one() {
         let grid = sloped_grid(-6.0, 40.0);
-        let blend = full_range_blend(&grid, intercept_db, 1.0);
+        let blend = full_range_blend(&grid, BASELINE, 1.0);
 
-        // The polynomial is flat here, so anything but the capture's own slope would be wrong
         for hz in [200.0f32, 1000.0, 5000.0] {
             let ln_freq = hz.ln();
-            let blended = intercept_db + blend.delta_ln(ln_freq, intercept_db);
-            let expected = intercept_db + (-6.0 * (ln_freq - ln_center));
+            let expected = (-6.0 - BASELINE) * (ln_freq - LN_CENTER);
+            let delta = blend.delta_ln(ln_freq);
 
             assert!(
-                (blended - expected).abs() < 0.05,
-                "at {hz} Hz: {blended} instead of {expected}"
+                (delta - expected).abs() < 0.05,
+                "at {hz} Hz: {delta} instead of {expected}"
+            );
+        }
+    }
+
+    /// What the capture replaces is the *assumption* about what music looks like, not the user's
+    /// own shaping. Crossfading against the whole polynomial instead took the threshold slope and
+    /// curve down with it, leaving two controls that silently did nothing whenever a capture was
+    /// applied.
+    #[test]
+    fn a_capture_leaves_the_threshold_slope_alone() {
+        let grid = sloped_grid(-6.0, 40.0);
+        let blend = full_range_blend(&grid, BASELINE, 1.0);
+
+        // Composed the way `recompute_thresholds()` composes them: the polynomial carries the
+        // assumed baseline plus whatever the user dialled in, and the capture moves it from there
+        let threshold_at = |user_slope: f32, ln_freq: f32| {
+            let polynomial = -12.0 + ((user_slope + BASELINE) * (ln_freq - LN_CENTER));
+            polynomial + blend.delta_ln(ln_freq)
+        };
+
+        for hz in [50.0f32, 1000.0, 15_000.0] {
+            let ln_freq = hz.ln();
+            let flat = threshold_at(0.0, ln_freq);
+            let tilted = threshold_at(2.0, ln_freq);
+
+            let expected = 2.0 * (ln_freq - LN_CENTER);
+            assert!(
+                (tilted - flat - expected).abs() < 1e-3,
+                "at {hz} Hz two decibels of slope moved the threshold by {}, not {expected}",
+                tilted - flat
             );
         }
     }
@@ -1225,21 +1259,20 @@ mod tests {
     #[test]
     fn a_zero_amount_moves_the_curve_by_exactly_nothing() {
         let grid = sloped_grid(-6.0, 40.0);
-        let blend = full_range_blend(&grid, -12.0, 0.0);
+        let blend = full_range_blend(&grid, BASELINE, 0.0);
 
         for hz in [20.0f32, 100.0, 1000.0, 19_000.0] {
-            let delta = blend.delta_ln(hz.ln(), -12.0);
-            assert_eq!(delta, 0.0, "at {hz} Hz");
+            assert_eq!(blend.delta_ln(hz.ln()), 0.0, "at {hz} Hz");
         }
     }
 
     #[test]
     fn half_an_amount_lands_halfway() {
-        let intercept_db = -12.0;
         let grid = sloped_grid(-6.0, 40.0);
+        let ln_freq = 100.0f32.ln();
 
-        let full = full_range_blend(&grid, intercept_db, 1.0).delta_ln(100.0f32.ln(), intercept_db);
-        let half = full_range_blend(&grid, intercept_db, 0.5).delta_ln(100.0f32.ln(), intercept_db);
+        let full = full_range_blend(&grid, BASELINE, 1.0).delta_ln(ln_freq);
+        let half = full_range_blend(&grid, BASELINE, 0.5).delta_ln(ln_freq);
 
         assert!(full.abs() > 1.0, "the test frequency has to actually move");
         assert!((half - (full * 0.5)).abs() < 1e-3);
@@ -1248,24 +1281,16 @@ mod tests {
     /// What "the cut part goes back to the pink noise curve" means: outside the band the capture
     /// stops contributing entirely.
     #[test]
-    fn cutting_the_low_end_hands_it_back_to_the_polynomial() {
-        let intercept_db = -12.0;
+    fn cutting_the_low_end_hands_it_back_to_the_baseline() {
         let grid = sloped_grid(-6.0, 40.0);
-        let blend = CaptureBlend::new(
-            &grid,
-            1000.0f32.ln(),
-            intercept_db,
-            1.0,
-            200.0,
-            CAPTURE_MAX_HZ,
-        );
+        let blend = CaptureBlend::new(&grid, LN_CENTER, BASELINE, 1.0, 200.0, CAPTURE_MAX_HZ);
 
         // Inside the band the capture applies in full
         assert!((blend.weight_ln(1000.0f32.ln()) - 1.0).abs() < 1e-3);
         assert!((blend.weight_ln(200.0f32.ln()) - 1.0).abs() < 1e-3);
-        // A full octave below the corner it is gone, and the polynomial is back on its own
+        // A full octave below the corner it is gone, and the baseline is back on its own
         assert!(blend.weight_ln(100.0f32.ln()).abs() < 1e-3);
-        assert_eq!(blend.delta_ln(100.0f32.ln(), intercept_db), 0.0);
+        assert_eq!(blend.delta_ln(100.0f32.ln()), 0.0);
         // And in between it is partway, rather than a step that would leave a ledge in the curve
         let halfway = blend.weight_ln(141.0f32.ln());
         assert!(
@@ -1277,7 +1302,7 @@ mod tests {
     #[test]
     fn cutting_the_high_end_hands_it_back_too() {
         let grid = sloped_grid(-6.0, 40.0);
-        let blend = CaptureBlend::new(&grid, 1000.0f32.ln(), -12.0, 1.0, CAPTURE_MIN_HZ, 5000.0);
+        let blend = CaptureBlend::new(&grid, LN_CENTER, BASELINE, 1.0, CAPTURE_MIN_HZ, 5000.0);
 
         assert!((blend.weight_ln(5000.0f32.ln()) - 1.0).abs() < 1e-3);
         assert!(blend.weight_ln(10_000.0f32.ln()).abs() < 1e-3);
@@ -1288,7 +1313,7 @@ mod tests {
     #[test]
     fn an_inverted_band_applies_nothing() {
         let grid = sloped_grid(-6.0, 40.0);
-        let blend = CaptureBlend::new(&grid, 1000.0f32.ln(), -12.0, 1.0, 8000.0, 200.0);
+        let blend = CaptureBlend::new(&grid, LN_CENTER, BASELINE, 1.0, 8000.0, 200.0);
 
         for hz in [20.0f32, 100.0, 1000.0, 8000.0, 19_000.0] {
             assert!(blend.weight_ln(hz.ln()) < 0.5, "at {hz} Hz");
@@ -1298,7 +1323,7 @@ mod tests {
     #[test]
     fn the_default_band_covers_everything() {
         let grid = sloped_grid(-6.0, 40.0);
-        let blend = full_range_blend(&grid, -12.0, 1.0);
+        let blend = full_range_blend(&grid, BASELINE, 1.0);
 
         for hz in [20.0f32, 1000.0, 20_000.0] {
             assert_eq!(blend.weight_ln(hz.ln()), 1.0, "at {hz} Hz");
