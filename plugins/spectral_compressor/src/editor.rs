@@ -588,6 +588,7 @@ fn controls(cx: &mut Context) {
 
         make_column(cx, "Threshold", |cx| {
             GenericUi::new(cx, Data::params.map(|p| p.threshold.clone()));
+            lf_bypass_rows(cx);
         });
 
         // The two compressor columns own the slope and curve of their own threshold curve, so the
@@ -600,6 +601,37 @@ fn controls(cx: &mut Context) {
     .bottom(Pixels(12.0))
     .child_left(Stretch(1.0))
     .child_right(Stretch(1.0));
+}
+
+/// The per-chain low frequency bypass.
+///
+/// It lives under the threshold column rather than in one of the compressor columns because it is
+/// not a threshold and it stops both directions at once. As everywhere else, every chain's row is
+/// built and the second one hidden while linked: a `Binding`'s entity is ignored by the layout, so
+/// rebuilding inside one would stack its children at the origin.
+fn lf_bypass_rows(cx: &mut Context) {
+    for chain_idx in 0..NUM_CHAINS {
+        VStack::new(cx, move |cx| {
+            // Which chain a row belongs to only needs saying once there are two of them
+            Label::new(
+                cx,
+                Data::params.map(move |p| chain_name(chain_idx, &p.global.stereo_mode.value())),
+            )
+            .font_size(11.0)
+            .color(DARKER_GRAY)
+            .left(Stretch(1.0))
+            .right(Pixels(7.0))
+            .display(Data::chain_mode.map(|mode| *mode == ChainMode::Split));
+
+            labelled_row(cx, "LF Bypass", move |cx| {
+                ParamSlider::new(cx, Data::params, move |p| {
+                    &p.threshold.chains[chain_idx].bypass_below_hz
+                });
+            });
+        })
+        .height(Auto)
+        .display(Data::chain_mode.map(move |mode| chain_idx == 0 || *mode == ChainMode::Split));
+    }
 }
 
 /// The Upwards and Downwards columns, with the toggle that links their curve shapes above them.

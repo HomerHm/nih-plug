@@ -60,3 +60,17 @@ impl<'a> Curve<'a> {
         self.evaluate_ln(freq.ln())
     }
 }
+
+/// Zero at or below `edge0`, one at or above `edge1`, and a smooth ramp in between.
+///
+/// A raised cosine would look the same but costs a transcendental per bin, and the callers run
+/// this across every bin of every threshold array.
+#[inline]
+pub fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    if edge1 <= edge0 {
+        return if x < edge0 { 0.0 } else { 1.0 };
+    }
+
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - (2.0 * t))
+}

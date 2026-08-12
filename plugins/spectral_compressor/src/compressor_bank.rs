@@ -23,7 +23,7 @@ use crate::analyzer::AnalyzerData;
 use crate::capture::{
     smooth_into, CaptureBank, CaptureBlend, CaptureParams, CaptureSource, CAPTURE_GRID_LEN,
 };
-use crate::curve::{Curve, CurveParams};
+use crate::curve::{smoothstep, Curve, CurveParams};
 use crate::eq_curve::{power_to_db, CompressorDirection, EqBankParams, EqCurve, EqCurveParams};
 use crate::SpectralCompressorParams;
 
@@ -39,6 +39,19 @@ const UPWARDS_NAME_PREFIX: &str = "Upwards";
 /// an assumption about what music looks like, which is exactly what a sound signature capture
 /// replaces -- see [`ThresholdParams::baseline_slope()`].
 const PINK_NOISE_SLOPE: f32 = -3.0;
+
+/// At or below this the low frequency bypass is switched off entirely.
+///
+/// This is what makes the parameter's leftmost position mean "off" without needing a separate
+/// switch. Nothing below twenty hertz is audible, and the FFT can barely resolve it either, so
+/// "bypass below twenty hertz" and "no bypass" are the same setting in practice.
+const LF_BYPASS_OFF_HZ: f32 = 20.0;
+
+/// How far above its corner the low frequency bypass fades back to full compression, in octaves.
+///
+/// Fixed rather than exposed. Switching compression off between one bin and the next is a step in
+/// the frequency response, and a step there is a long tail in the time domain.
+const LF_BYPASS_FADE_OCTAVES: f32 = 0.5;
 
 /// The envelopes are initialized to the RMS value of a -24 dB sine wave to make sure extreme upwards
 /// compression doesn't cause pops when switching between window sizes and when deactivating and
@@ -75,6 +88,8 @@ pub struct CompressorBank {
     pub should_update_downwards_knee_parabolas: Arc<AtomicBool>,
     /// The same as `should_update_downwards_knee_parabolas`, but for upwards compression.
     pub should_update_upwards_knee_parabolas: Arc<AtomicBool>,
+    /// If set, then the low frequency bypass weights should be recomputed on the next cycle.
+    pub should_update_process_weights: Arc<AtomicBool>,
 
     /// For each compressor bin, `ln(freq)` where `freq` is the frequency associated with that
     /// compressor. This is precomputed since all update functions need it.
@@ -107,6 +122,14 @@ pub struct CompressorBank {
     upwards_knee_parabola_scale: [Vec<f32>; NUM_CHAINS],
     /// `downwards_knee_parabola_intercept`, but for the upwards compressors.
     upwards_knee_parabola_intercept: [Vec<f32>; NUM_CHAINS],
+
+    /// How much of the computed gain change each bin actually receives, from zero to one. This is
+    /// what the low frequency bypass acts through: at zero a bin comes out exactly as it went in.
+    ///
+    /// Applied to the gain rather than to the threshold because no threshold can express "leave
+    /// this alone" -- raising it stops downwards compression but makes upwards compression lift
+    /// *more*, which is the opposite of what is wanted.
+    process_weights: [Vec<f32>; NUM_CHAINS],
 
     /// The current envelope value for this bin, in linear space. Indexed by
     /// `[channel_idx][compressor_idx]`.
@@ -261,6 +284,14 @@ pub struct ChainParams {
     pub upwards: ThresholdCurveParams,
     #[nested(id_prefix = "downwards", group = "Downwards")]
     pub downwards: ThresholdCurveParams,
+
+    /// Below this frequency the chain is left alone entirely, in both directions.
+    ///
+    /// Per chain because the two carry different signals: the low end of a side channel is a very
+    /// different thing from the low end of a mid channel, and wanting to protect one but not the
+    /// other is the normal case rather than an exotic one.
+    #[id = "lfbypass"]
+    pub bypass_below_hz: FloatParam,
 }
 
 /// This struct contains the parameters for either the upward or downward compressors. The `Params`
@@ -356,6 +387,7 @@ impl ChainParams {
         chain_idx: usize,
         set_update_downwards_thresholds: Arc<dyn Fn(f32) + Send + Sync>,
         set_update_upwards_thresholds: Arc<dyn Fn(f32) + Send + Sync>,
+        set_update_process_weights: Arc<dyn Fn(f32) + Send + Sync>,
     ) -> Self {
         // The chains are named neutrally because what they mean depends on the stereo mode; the
         // editor labels them Left/Right or Mid/Side to match
@@ -370,6 +402,35 @@ impl ChainParams {
                 &format!("{name_prefix} {DOWNWARDS_NAME_PREFIX}"),
                 set_update_downwards_thresholds,
             ),
+
+            bypass_below_hz: FloatParam::new(
+                format!("{name_prefix} LF Bypass"),
+                LF_BYPASS_OFF_HZ,
+                FloatRange::Skewed {
+                    min: LF_BYPASS_OFF_HZ,
+                    max: 1000.0,
+                    factor: FloatRange::skew_factor(-2.0),
+                },
+            )
+            .with_callback(set_update_process_weights)
+            // The leftmost position is off rather than a twenty hertz corner, so it says so
+            .with_value_to_string(Arc::new(|value| {
+                if value <= LF_BYPASS_OFF_HZ {
+                    String::from("Off")
+                } else if value < 1000.0 {
+                    format!("{value:.0} Hz")
+                } else {
+                    format!("{:.2} kHz", value / 1000.0)
+                }
+            }))
+            .with_string_to_value(Arc::new(|string| {
+                let string = string.trim();
+                if string.eq_ignore_ascii_case("off") {
+                    return Some(LF_BYPASS_OFF_HZ);
+                }
+                formatters::s2v_f32_hz_then_khz()(string)
+            }))
+            .hide_in_generic_ui(),
         }
     }
 }
@@ -392,6 +453,12 @@ impl ThresholdParams {
             should_update_upwards_thresholds.store(true, Ordering::SeqCst);
             should_update_downwards_knee_parabolas.store(true, Ordering::SeqCst);
             should_update_upwards_knee_parabolas.store(true, Ordering::SeqCst);
+        });
+
+        let set_update_process_weights: Arc<dyn Fn(f32) + Send + Sync> = Arc::new({
+            let should_update_process_weights =
+                compressor_bank.should_update_process_weights.clone();
+            move |_| should_update_process_weights.store(true, Ordering::SeqCst)
         });
 
         let set_update_both_thresholds_for_chains = set_update_both_thresholds.clone();
@@ -455,6 +522,7 @@ impl ThresholdParams {
                     chain_idx,
                     set_update_downwards_thresholds.clone(),
                     set_update_upwards_thresholds.clone(),
+                    set_update_process_weights.clone(),
                 )
             }),
             eq: EqBankParams::new("", set_update_both_thresholds_for_chains),
@@ -597,6 +665,7 @@ impl CompressorBank {
             should_update_upwards_ratios: Arc::new(AtomicBool::new(true)),
             should_update_downwards_knee_parabolas: Arc::new(AtomicBool::new(true)),
             should_update_upwards_knee_parabolas: Arc::new(AtomicBool::new(true)),
+            should_update_process_weights: Arc::new(AtomicBool::new(true)),
 
             ln_freqs: Vec::with_capacity(complex_buffer_len),
             freqs: Vec::with_capacity(complex_buffer_len),
@@ -621,6 +690,8 @@ impl CompressorBank {
             upwards_knee_parabola_intercept: std::array::from_fn(|_| {
                 Vec::with_capacity(complex_buffer_len)
             }),
+
+            process_weights: std::array::from_fn(|_| Vec::with_capacity(complex_buffer_len)),
 
             envelopes: vec![Vec::with_capacity(complex_buffer_len); num_channels],
             spectrum_magnitudes: vec![Vec::with_capacity(complex_buffer_len); num_channels],
@@ -651,6 +722,9 @@ impl CompressorBank {
         self.eq_power
             .reserve_exact(complex_buffer_len.saturating_sub(self.eq_power.len()));
 
+        for buffer in self.process_weights.iter_mut() {
+            buffer.reserve_exact(complex_buffer_len.saturating_sub(buffer.len()));
+        }
         for buffer in self.downwards_thresholds_db.iter_mut() {
             buffer.reserve_exact(complex_buffer_len.saturating_sub(buffer.len()));
         }
@@ -717,6 +791,9 @@ impl CompressorBank {
             *freq_hz = freq;
         }
 
+        for buffer in self.process_weights.iter_mut() {
+            buffer.resize(complex_buffer_len, 1.0);
+        }
         for buffer in self.downwards_thresholds_db.iter_mut() {
             buffer.resize(complex_buffer_len, 1.0);
         }
@@ -766,6 +843,8 @@ impl CompressorBank {
         self.should_update_downwards_knee_parabolas
             .store(true, Ordering::SeqCst);
         self.should_update_upwards_knee_parabolas
+            .store(true, Ordering::SeqCst);
+        self.should_update_process_weights
             .store(true, Ordering::SeqCst);
     }
 
@@ -1090,6 +1169,7 @@ impl CompressorBank {
 
         assert!(analyzer_input_data.gain_difference_db[chain_idx].len() >= buffer.len());
         assert!(analyzer_input_data.envelope_followers[chain_idx].len() >= buffer.len());
+        assert!(self.process_weights[chain_idx].len() == buffer.len());
         assert!(self.downwards_thresholds_db[chain_idx].len() == buffer.len());
         assert!(self.downwards_ratios.len() == buffer.len());
         assert!(self.downwards_knee_parabola_scale[chain_idx].len() == buffer.len());
@@ -1152,9 +1232,17 @@ impl CompressorBank {
             };
 
             // If the comprssed output is -10 dBFS and the envelope follower was at -6 dBFS, then we
-            // want to apply -4 dB of gain to the bin
-            let gain_difference_db =
-                downwards_compressed + upwards_compressed - (envelope_db * 2.0);
+            // want to apply -4 dB of gain to the bin. The weight is what the low frequency bypass
+            // acts through, and it is applied here rather than to the thresholds so that both
+            // directions stop together.
+            let gain_difference_db = (downwards_compressed + upwards_compressed
+                - (envelope_db * 2.0))
+                * unsafe {
+                    *self
+                        .process_weights
+                        .get_unchecked(chain_idx)
+                        .get_unchecked(bin_idx)
+                };
             unsafe {
                 *analyzer_input_data
                     .gain_difference_db
@@ -1199,6 +1287,7 @@ impl CompressorBank {
         assert!(analyzer_input_data.gain_difference_db[chain_idx].len() >= buffer.len());
         assert!(analyzer_input_data.envelope_followers[chain_idx].len() >= buffer.len());
         assert!(self.sidechain_spectrum_magnitudes[channel_idx].len() == buffer.len());
+        assert!(self.process_weights[chain_idx].len() == buffer.len());
         assert!(self.downwards_thresholds_db[chain_idx].len() == buffer.len());
         assert!(self.downwards_ratios.len() == buffer.len());
         assert!(self.upwards_thresholds_db[chain_idx].len() == buffer.len());
@@ -1281,9 +1370,17 @@ impl CompressorBank {
             };
 
             // If the comprssed output is -10 dBFS and the envelope follower was at -6 dBFS, then we
-            // want to apply -4 dB of gain to the bin
-            let gain_difference_db =
-                downwards_compressed + upwards_compressed - (envelope_db * 2.0);
+            // want to apply -4 dB of gain to the bin. The weight is what the low frequency bypass
+            // acts through, and it is applied here rather than to the thresholds so that both
+            // directions stop together.
+            let gain_difference_db = (downwards_compressed + upwards_compressed
+                - (envelope_db * 2.0))
+                * unsafe {
+                    *self
+                        .process_weights
+                        .get_unchecked(chain_idx)
+                        .get_unchecked(bin_idx)
+                };
             unsafe {
                 *analyzer_input_data
                     .gain_difference_db
@@ -1350,6 +1447,28 @@ impl CompressorBank {
             *threshold_db =
                 (polynomial_db + capture_delta(*ln_freq) + power_to_db(*eq_power) + intercept_db)
                     .max(util::MINUS_INFINITY_DB);
+        }
+    }
+
+    /// Fill `weights` with how much of the computed gain change each bin should receive.
+    ///
+    /// Everything below the corner comes out at zero, which is a true bypass rather than a very
+    /// high threshold: a threshold that stops downwards compression makes upwards compression lift
+    /// *harder*, so there is no threshold that means "leave this alone".
+    ///
+    /// The fade above the corner matters more than it looks. Switching compression off between one
+    /// bin and the next is a step in the frequency response, and a step in frequency is a long tail
+    /// in time.
+    fn recompute_process_weights(ln_freqs: &[f32], weights: &mut [f32], bypass_below_hz: f32) {
+        if bypass_below_hz <= LF_BYPASS_OFF_HZ {
+            weights.fill(1.0);
+            return;
+        }
+
+        let ln_corner = bypass_below_hz.ln();
+        let ln_full = ln_corner + (LF_BYPASS_FADE_OCTAVES * std::f32::consts::LN_2);
+        for (ln_freq, weight) in ln_freqs.iter().zip(weights.iter_mut()) {
+            *weight = smoothstep(ln_corner, ln_full, *ln_freq);
         }
     }
 
@@ -1482,6 +1601,20 @@ impl CompressorBank {
                     CompressorDirection::Upwards,
                     chain_idx,
                     chain.upwards.threshold_offset_db.value(),
+                );
+            }
+        }
+
+        if self
+            .should_update_process_weights
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            for (chain_idx, chain) in params.threshold.chains.iter().enumerate() {
+                Self::recompute_process_weights(
+                    &self.ln_freqs,
+                    &mut self.process_weights[chain_idx],
+                    chain.bypass_below_hz.value(),
                 );
             }
         }
@@ -1711,6 +1844,58 @@ fn upwards_soft_knee_coefficients(threshold_db: f32, knee_width_db: f32, ratio: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bypass weights over a spread of frequencies, for a given corner.
+    fn bypass_weights(bypass_below_hz: f32, frequencies: &[f32]) -> Vec<f32> {
+        let ln_freqs: Vec<f32> = frequencies.iter().map(|hz| hz.ln()).collect();
+        let mut weights = vec![0.0; ln_freqs.len()];
+        CompressorBank::recompute_process_weights(&ln_freqs, &mut weights, bypass_below_hz);
+
+        weights
+    }
+
+    /// The parameter's leftmost position means off, so nothing anywhere may be held back.
+    #[test]
+    fn the_low_frequency_bypass_is_off_at_its_minimum() {
+        for weight in bypass_weights(LF_BYPASS_OFF_HZ, &[20.0, 25.0, 40.0, 1000.0, 20_000.0]) {
+            assert_eq!(weight, 1.0);
+        }
+    }
+
+    #[test]
+    fn the_low_frequency_bypass_stops_everything_below_its_corner() {
+        let weights = bypass_weights(100.0, &[20.0, 50.0, 100.0]);
+        for (weight, hz) in weights.iter().zip([20.0, 50.0, 100.0]) {
+            assert_eq!(*weight, 0.0, "at {hz} Hz");
+        }
+    }
+
+    #[test]
+    fn the_low_frequency_bypass_leaves_everything_above_the_fade_alone() {
+        // The fade is half an octave wide, so anything past about 142 Hz is fully compressed again
+        let weights = bypass_weights(100.0, &[145.0, 1000.0, 20_000.0]);
+        for (weight, hz) in weights.iter().zip([145.0, 1000.0, 20_000.0]) {
+            assert_eq!(*weight, 1.0, "at {hz} Hz");
+        }
+    }
+
+    /// A step here would be a step in the frequency response, and a step in frequency is a long
+    /// tail in time. The fade is what keeps that from happening, so it gets a test.
+    #[test]
+    fn the_low_frequency_bypass_fades_rather_than_switching() {
+        let frequencies = [100.0, 105.0, 110.0, 118.0, 126.0, 134.0, 142.0];
+        let weights = bypass_weights(100.0, &frequencies);
+
+        for pair in weights.windows(2) {
+            assert!(pair[1] >= pair[0], "the fade has to climb, got {pair:?}");
+        }
+        // And it really is partway through the middle rather than jumping at one end
+        let middle = weights[3];
+        assert!(
+            middle > 0.15 && middle < 0.85,
+            "expected a gradual fade, got {middle}"
+        );
+    }
 
     /// The weights `update_envelopes` derives from the channel link amount.
     fn weights(link: f32, num_channels: f32) -> (f32, f32) {

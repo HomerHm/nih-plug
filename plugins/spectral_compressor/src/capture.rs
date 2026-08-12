@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::compressor_bank::NUM_CHAINS;
+use crate::curve::smoothstep;
 
 /// How many stereo modes there are. The capture is stored separately per mode because the two
 /// chains hold completely different signals in each one: left/right versus mid/side. A right
@@ -905,20 +906,6 @@ impl<'a> CaptureBlend<'a> {
         let baseline_db = self.baseline_slope * (ln_freq - self.ln_center_frequency);
         (self.curve.evaluate_ln(ln_freq) - baseline_db) * weight
     }
-}
-
-/// Zero at or below `edge0`, one at or above `edge1`, and a smooth ramp in between.
-///
-/// A raised cosine would look the same but costs a transcendental per bin, and this runs across
-/// every bin of every threshold array.
-#[inline]
-fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
-    if edge1 <= edge0 {
-        return if x < edge0 { 0.0 } else { 1.0 };
-    }
-
-    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
-    t * t * (3.0 - (2.0 * t))
 }
 
 #[cfg(test)]
