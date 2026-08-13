@@ -20,7 +20,7 @@ use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::widgets::*;
 use nih_plug_vizia::{assets, create_vizia_editor, ViziaState, ViziaTheming};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use self::analyzer::{format_frequency, frequency_to_t, Analyzer, FREQUENCY_TICKS};
@@ -28,7 +28,9 @@ use self::param_link::{param_ptr_by_id, param_ptr_pairs, ParamLink, ParamLinkEve
 use crate::analyzer::AnalyzerData;
 use crate::capture::SharedCaptureState;
 use crate::compressor_bank::{ThresholdCurveParams, NUM_CHAINS};
-use crate::eq_curve::{CompressorDirection, EqNodeChannel, EqNodeParams, EqNodeType, MAX_EQ_NODES};
+use crate::eq_curve::{
+    CompressorDirection, EqNodeChannel, EqNodeParams, EqNodeType, MAX_EQ_NODES, NO_SOLO,
+};
 use crate::{SoloMode, StereoMode};
 use crate::{SpectralCompressor, SpectralCompressorParams};
 use crossbeam::atomic::AtomicCell;
@@ -151,6 +153,9 @@ pub enum EditorEvent {
     SelectDirection(CompressorDirection),
     /// Select a node for the inspector below the analyzer, or clear it.
     SelectNode(Option<usize>),
+    /// Listen to one node's contribution on its own, or release the solo. Momentary, and
+    /// deliberately not a parameter.
+    SetNodeSolo(Option<usize>),
     /// Start or stop folding the input into the captured curve.
     ToggleCapture,
     /// Throw away the current stereo mode's captured curves.
@@ -183,6 +188,13 @@ pub struct Data {
     /// The node the inspector below the analyzer is editing. There is one shared bank of nodes,
     /// each carrying which chain it belongs to, so an index identifies a node on its own.
     pub(crate) selected_node: Option<usize>,
+    /// Which node is being listened to on its own, shared with the audio thread. [`NO_SOLO`] when
+    /// none is. Not a parameter, for the same reason [`Self::solo`] isn't.
+    pub(crate) node_solo: Arc<AtomicUsize>,
+    /// The same value as [`Self::node_solo`], as a plain copy so the solo buttons can watch it.
+    /// Storing into an `Arc<AtomicUsize>` leaves the `Arc` itself unchanged, so nothing bound to it
+    /// through a lens would ever be told to update.
+    pub(crate) soloed_node: Option<usize>,
 
     /// Raised while the user holds capture, and to throw the current stereo mode's curves away.
     /// Both are actions rather than settings, so like [`Self::solo`] they are not parameters.
@@ -209,6 +221,11 @@ impl Model for Data {
             EditorEvent::SelectDirection(direction) => self.edited_direction = *direction,
             EditorEvent::SelectNode(node_index) => {
                 self.selected_node = *node_index;
+            }
+            EditorEvent::SetNodeSolo(node_index) => {
+                self.soloed_node = *node_index;
+                self.node_solo
+                    .store(node_index.unwrap_or(NO_SOLO), Ordering::Relaxed);
             }
             EditorEvent::ToggleCapture => {
                 self.capturing = !self.capturing;
@@ -338,6 +355,15 @@ fn title_bar(cx: &mut Context) {
             .bottom(Pixels(5.0))
             .left(Pixels(8.0))
             .on_mouse_down(|_, _| open_url(MOD_URL));
+
+        // Pushed to the far right, away from everything that only acts on part of the plugin.
+        // Coloured as a warning like the solos: it changes what the plugin is doing in a way
+        // nothing else on screen announces, and the analyzer keeps running while it is on.
+        ParamButton::new(cx, Data::params, |p| &p.global.bypass)
+            .with_label("Bypass")
+            .class("capture-button")
+            .left(Stretch(1.0))
+            .right(Pixels(12.0));
     })
     .height(Pixels(30.0))
     .left(Pixels(12.0))
@@ -389,6 +415,11 @@ fn analyzer_graph(cx: &mut Context, chain_idx: usize) {
             Data::params,
             Data::edited_direction,
             Data::selected_node,
+            // Read live rather than through a lens: the drawing and hit testing that need it run
+            // without a context to resolve one against
+            cx.data::<Data>()
+                .map(|data| data.node_solo.clone())
+                .unwrap_or_else(|| Arc::new(AtomicUsize::new(NO_SOLO))),
             chain_idx,
             // Not baked in: switching modes changes what a new node is given, and whether the
             // other chain is drawn behind this one, without the graph being rebuilt
@@ -821,6 +852,32 @@ fn node_inspector(cx: &mut Context) {
                 ParamSlider::new(cx, params, move |p| &p.threshold.eq.nodes[index].q)
                     .width(Pixels(90.0));
 
+                // Lit means the node is shaping the curve. Labelled for the state it is in rather
+                // than for what clicking does, so it reads the same way as the hollow handle the
+                // graph draws for a node that isn't contributing.
+                ParamButton::new(cx, params, move |p| &p.threshold.eq.nodes[index].enabled)
+                    .with_label("Active")
+                    .class("direction-button");
+
+                // Soloing overrides every node's own state, so it is coloured as a warning like
+                // the chain solos: left engaged, it silently drops every other node from the curve.
+                Button::new(
+                    cx,
+                    move |cx| {
+                        let engaged = cx
+                            .data::<Data>()
+                            .is_some_and(|data| data.soloed_node == Some(index));
+                        cx.emit(EditorEvent::SetNodeSolo(if engaged {
+                            None
+                        } else {
+                            Some(index)
+                        }));
+                    },
+                    |cx| Label::new(cx, "Solo").font_size(12.0),
+                )
+                .checked(Data::soloed_node.map(move |soloed| *soloed == Some(index)))
+                .class("solo-button");
+
                 Button::new(
                     cx,
                     move |cx| {
@@ -838,6 +895,14 @@ fn node_inspector(cx: &mut Context) {
                             off_index,
                             EqNodeType::variants().len(),
                         );
+                        // A solo pointing at a node that no longer exists would leave every curve
+                        // empty with nothing on screen to explain why
+                        if cx
+                            .data::<Data>()
+                            .is_some_and(|data| data.soloed_node == Some(index))
+                        {
+                            cx.emit(EditorEvent::SetNodeSolo(None));
+                        }
                         cx.emit(EditorEvent::SelectNode(None));
                     },
                     |cx| Label::new(cx, "Delete").font_size(12.0),

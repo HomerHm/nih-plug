@@ -16,7 +16,7 @@
 
 use nih_plug::prelude::*;
 use realfft::num_complex::Complex32;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::analyzer::AnalyzerData;
@@ -24,7 +24,9 @@ use crate::capture::{
     smooth_into, CaptureBank, CaptureBlend, CaptureParams, CaptureSource, CAPTURE_GRID_LEN,
 };
 use crate::curve::{smoothstep, Curve, CurveParams};
-use crate::eq_curve::{power_to_db, CompressorDirection, EqBankParams, EqCurve, EqCurveParams};
+use crate::eq_curve::{
+    power_to_db, soloed_index, CompressorDirection, EqBankParams, EqCurve, EqCurveParams, NO_SOLO,
+};
 use crate::SpectralCompressorParams;
 
 // These are the parameter name prefixes used for the downwards and upwards compression parameters.
@@ -158,6 +160,15 @@ pub struct CompressorBank {
     /// One chain's captured curve after smoothing, rebuilt just before the threshold arrays that
     /// use it. Kept here so smoothing never allocates on the audio thread.
     capture_smoothed: Vec<f32>,
+
+    /// Which EQ node is being listened to on its own, set from the editor. [`NO_SOLO`] when none
+    /// is. Deliberately not a parameter: a solo left engaged should not outlive the session.
+    pub node_solo: Arc<AtomicUsize>,
+    /// The value of [`Self::node_solo`] the threshold arrays were last built from.
+    ///
+    /// Soloing changes which nodes contribute to the curves, but nothing calls a parameter
+    /// callback to say so, so this is compared against the shared value once per block instead.
+    last_node_solo: usize,
 
     /// The input data for the spectrum analyzer. Stores both the spectrum analyzer values and the
     /// current gain reduction. Used to draw the spectrum analyzer and gain reduction display in the
@@ -705,6 +716,9 @@ impl CompressorBank {
 
             capture: CaptureBank::new(complex_buffer_len),
             capture_smoothed: vec![0.0; CAPTURE_GRID_LEN],
+
+            node_solo: Arc::new(AtomicUsize::new(NO_SOLO)),
+            last_node_solo: NO_SOLO,
 
             analyzer_input_data,
         }
@@ -1541,9 +1555,16 @@ impl CompressorBank {
     /// Update the compressors if needed. This is called just before processing, and the compressors
     /// are updated in accordance to the atomic flags set on this struct.
     fn update_if_needed(&mut self, params: &SpectralCompressorParams) {
+        // Soloing a node changes which nodes deform the curves, and it reaches the audio thread as
+        // a bare atomic rather than through a parameter callback, so there is nothing to set the
+        // flags below except a comparison against what was last built.
+        let node_solo = self.node_solo.load(Ordering::Relaxed);
+        let solo_changed = node_solo != self.last_node_solo;
+        self.last_node_solo = node_solo;
+
         // A capture that grew, got cleared, or arrived with a preset changes the base shape of
         // both curves, and the knee parabolas are built from the thresholds so they follow
-        if self.capture.take_dirty() {
+        if self.capture.take_dirty() || solo_changed {
             self.should_update_downwards_thresholds
                 .store(true, Ordering::SeqCst);
             self.should_update_upwards_thresholds
@@ -1581,7 +1602,7 @@ impl CompressorBank {
                     &mut self.eq_power,
                     &mut self.downwards_thresholds_db[chain_idx],
                     &curve_params,
-                    &params.threshold.eq.snapshot(),
+                    &params.threshold.eq.snapshot(soloed_index(node_solo)),
                     blend.as_ref(),
                     CompressorDirection::Downwards,
                     chain_idx,
@@ -1614,7 +1635,7 @@ impl CompressorBank {
                     &mut self.eq_power,
                     &mut self.upwards_thresholds_db[chain_idx],
                     &curve_params,
-                    &params.threshold.eq.snapshot(),
+                    &params.threshold.eq.snapshot(soloed_index(node_solo)),
                     blend.as_ref(),
                     CompressorDirection::Upwards,
                     chain_idx,

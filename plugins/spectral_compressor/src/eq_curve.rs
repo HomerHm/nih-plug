@@ -36,6 +36,17 @@ use std::sync::Arc;
 /// would silently lose them.
 pub const MAX_EQ_NODES: usize = 12;
 
+/// The value the shared node solo holds when nothing is soloed.
+///
+/// Soloing is an action rather than a setting, so like the chain solo it is shared as a plain
+/// atomic instead of a parameter and never gets saved with a project.
+pub const NO_SOLO: usize = usize::MAX;
+
+/// Interpret a raw shared solo value, treating anything out of range as no solo at all.
+pub fn soloed_index(raw: usize) -> Option<usize> {
+    (raw < MAX_EQ_NODES).then_some(raw)
+}
+
 /// Which of the two compressors something applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressorDirection {
@@ -190,6 +201,15 @@ impl EqNodeType {
 #[derive(Debug, Clone, Copy)]
 pub struct EqNode {
     pub node_type: EqNodeType,
+    /// Whether this node contributes to the curve at all.
+    ///
+    /// This is separate from [`EqNodeType::Off`] because that is what deleting a node means. A
+    /// bypassed node keeps its type, so it still gets a handle on the graph and can be switched
+    /// back on without setting it up again.
+    ///
+    /// The editor folds a node solo into this before the curve is built, so both the drawn curve
+    /// and the audible one see the same set of active nodes.
+    pub enabled: bool,
     pub target: EqNodeTarget,
     pub channel: EqNodeChannel,
     pub center_frequency: f32,
@@ -201,6 +221,7 @@ impl Default for EqNode {
     fn default() -> Self {
         EqNode {
             node_type: EqNodeType::Off,
+            enabled: true,
             target: EqNodeTarget::Both,
             channel: EqNodeChannel::Both,
             center_frequency: 1000.0,
@@ -240,6 +261,27 @@ impl Default for EqCurveParams {
     fn default() -> Self {
         EqCurveParams {
             nodes: [EqNode::default(); MAX_EQ_NODES],
+        }
+    }
+}
+
+impl EqCurveParams {
+    /// Fold a node solo into every node's enabled state.
+    ///
+    /// A solo overrides the nodes' own bypasses in both directions: the soloed node is switched on
+    /// even if it was bypassed, and every other one is switched off. Soloing something and hearing
+    /// nothing because it happened to be bypassed would be a puzzle rather than an answer, and the
+    /// button that engages the solo sits right next to the one that bypassed it.
+    ///
+    /// Applied here, on the snapshot both the DSP and the editor build their curves from, so the
+    /// drawn curve and the audible one cannot disagree about which nodes count.
+    pub fn apply_solo(&mut self, soloed: Option<usize>) {
+        let Some(soloed) = soloed else {
+            return;
+        };
+
+        for (index, node) in self.nodes.iter_mut().enumerate() {
+            node.enabled = index == soloed;
         }
     }
 }
@@ -290,7 +332,7 @@ enum PreparedShape {
 impl PreparedNode {
     /// Precompute a node's constants, or `None` if it's switched off.
     fn new(node: &EqNode) -> Option<Self> {
-        if node.node_type == EqNodeType::Off {
+        if node.node_type == EqNodeType::Off || !node.enabled {
             return None;
         }
 
@@ -480,6 +522,10 @@ pub fn power_to_db(power: f32) -> f32 {
 pub struct EqNodeParams {
     #[id = "eqtype"]
     pub node_type: EnumParam<EqNodeType>,
+    /// Whether this node contributes to the curve. Switching it off leaves everything else about
+    /// the node alone, unlike setting its type to `Off`, which is what deleting it means.
+    #[id = "eqon"]
+    pub enabled: BoolParam,
     /// Which compressor's curve this node deforms.
     #[id = "eqtarget"]
     pub target: EnumParam<EqNodeTarget>,
@@ -514,6 +560,12 @@ impl EqNodeParams {
                 Arc::new(move |_| set_update_thresholds(0.0))
             })
             .hide_in_generic_ui(),
+            enabled: BoolParam::new(format!("{name_prefix}Node {node_number} Enabled"), true)
+                .with_callback({
+                    let set_update_thresholds = set_update_thresholds.clone();
+                    Arc::new(move |_| set_update_thresholds(0.0))
+                })
+                .hide_in_generic_ui(),
             target: EnumParam::new(
                 format!("{name_prefix}Node {node_number} Target"),
                 EqNodeTarget::Both,
@@ -577,6 +629,7 @@ impl EqNodeParams {
     pub fn snapshot(&self) -> EqNode {
         EqNode {
             node_type: self.node_type.value(),
+            enabled: self.enabled.value(),
             target: self.target.value(),
             channel: self.channel.value(),
             center_frequency: self.center_frequency.value(),
@@ -606,10 +659,16 @@ impl EqBankParams {
     }
 
     /// Read every node's current values into a plain-data snapshot.
-    pub fn snapshot(&self) -> EqCurveParams {
-        EqCurveParams {
+    ///
+    /// `soloed` is the index of a node being listened to on its own. See
+    /// [`EqCurveParams::apply_solo()`] for what that does to the rest of the bank.
+    pub fn snapshot(&self, soloed: Option<usize>) -> EqCurveParams {
+        let mut params = EqCurveParams {
             nodes: std::array::from_fn(|index| self.nodes[index].snapshot()),
-        }
+        };
+        params.apply_solo(soloed);
+
+        params
     }
 }
 
@@ -627,6 +686,7 @@ mod tests {
     /// A node of `node_type` at 1 kHz with the given gain.
     fn bell(gain_db: f32) -> EqNode {
         EqNode {
+            enabled: true,
             node_type: EqNodeType::Bell,
             target: EqNodeTarget::Both,
             channel: EqNodeChannel::Both,
@@ -639,6 +699,7 @@ mod tests {
     /// A cut node of `node_type` at `center_frequency`.
     fn cut(node_type: EqNodeType, center_frequency: f32) -> EqNode {
         EqNode {
+            enabled: true,
             node_type,
             target: EqNodeTarget::Both,
             channel: EqNodeChannel::Both,
@@ -696,11 +757,81 @@ mod tests {
         assert_eq!(curve.evaluate_db(1000.0), 0.0);
     }
 
+    /// A bypassed node keeps its type, so unlike a deleted one it is still there to be switched
+    /// back on. It must not reach the curve while it is off.
+    #[test]
+    fn bypassed_nodes_contribute_nothing() {
+        let mut node = bell(6.0);
+        assert!((node_db(node, 1000.0) - 6.0).abs() < 0.01);
+
+        node.enabled = false;
+        let mut params = EqCurveParams::default();
+        params.nodes[0] = node;
+        let curve = EqCurve::new(&params, CompressorDirection::Downwards, 0);
+
+        assert!(curve.is_empty());
+        assert_eq!(curve.evaluate_db(1000.0), 0.0);
+    }
+
+    /// Two bells at the same frequency that cancel, so whichever survives a solo is obvious from
+    /// the sign of the result.
+    fn cancelling_bank() -> EqCurveParams {
+        let mut params = EqCurveParams::default();
+        params.nodes[0] = bell(6.0);
+        params.nodes[1] = bell(-6.0);
+
+        params
+    }
+
+    fn bank_db(bank: &EqCurveParams, soloed: Option<usize>) -> f32 {
+        let mut params = *bank;
+        params.apply_solo(soloed);
+
+        EqCurve::new(&params, CompressorDirection::Downwards, 0).evaluate_db(1000.0)
+    }
+
+    /// Soloing has to reach the curve through the same snapshot the compressors read, or the graph
+    /// would show one thing and the audio would do another.
+    #[test]
+    fn soloing_leaves_only_the_soloed_node() {
+        let bank = cancelling_bank();
+
+        assert!(bank_db(&bank, None).abs() < 0.01, "the bells should cancel");
+        assert!((bank_db(&bank, Some(0)) - 6.0).abs() < 0.01);
+        assert!((bank_db(&bank, Some(1)) + 6.0).abs() < 0.01);
+    }
+
+    /// Soloing a node that happens to be bypassed switches it on. Hearing nothing at all would be
+    /// a puzzle rather than an answer, and the button that engaged the solo is the one right next
+    /// to the one that bypassed it.
+    #[test]
+    fn soloing_overrides_a_bypassed_node() {
+        let mut bank = cancelling_bank();
+        bank.nodes[0].enabled = false;
+
+        assert!(
+            (bank_db(&bank, None) + 6.0).abs() < 0.01,
+            "only the second bell should be left"
+        );
+        assert!((bank_db(&bank, Some(0)) - 6.0).abs() < 0.01);
+    }
+
+    /// Anything that isn't a real node index means no solo, so a stale or garbage shared value
+    /// cannot silently empty every curve.
+    #[test]
+    fn out_of_range_solo_indices_mean_no_solo() {
+        assert_eq!(soloed_index(NO_SOLO), None);
+        assert_eq!(soloed_index(MAX_EQ_NODES), None);
+        assert_eq!(soloed_index(MAX_EQ_NODES - 1), Some(MAX_EQ_NODES - 1));
+        assert_eq!(soloed_index(0), Some(0));
+    }
+
     #[test]
     fn bell_hits_its_gain_at_the_center_frequency() {
         for gain_db in [-18.0, -6.0, 6.0, 18.0] {
             let db = node_db(
                 EqNode {
+                    enabled: true,
                     node_type: EqNodeType::Bell,
                     target: EqNodeTarget::Both,
                     channel: EqNodeChannel::Both,
@@ -720,6 +851,7 @@ mod tests {
     #[test]
     fn bell_decays_to_unity_away_from_its_center() {
         let node = EqNode {
+            enabled: true,
             node_type: EqNodeType::Bell,
             target: EqNodeTarget::Both,
             channel: EqNodeChannel::Both,
@@ -734,6 +866,7 @@ mod tests {
     #[test]
     fn shelves_reach_their_gain_on_the_correct_side() {
         let low = EqNode {
+            enabled: true,
             node_type: EqNodeType::LowShelf,
             target: EqNodeTarget::Both,
             channel: EqNodeChannel::Both,
@@ -745,6 +878,7 @@ mod tests {
         assert!(node_db(low, 20_000.0).abs() < 0.5);
 
         let high = EqNode {
+            enabled: true,
             node_type: EqNodeType::HighShelf,
             ..low
         };
@@ -764,6 +898,7 @@ mod tests {
         ] {
             let db = node_db(
                 EqNode {
+                    enabled: true,
                     node_type,
                     target: EqNodeTarget::Both,
                     channel: EqNodeChannel::Both,
@@ -789,6 +924,7 @@ mod tests {
             (EqNodeType::LowCut48, 48.0),
         ] {
             let node = EqNode {
+                enabled: true,
                 node_type,
                 target: EqNodeTarget::Both,
                 channel: EqNodeChannel::Both,
@@ -809,6 +945,7 @@ mod tests {
     #[test]
     fn notch_nulls_at_its_center_and_recovers_beside_it() {
         let node = EqNode {
+            enabled: true,
             node_type: EqNodeType::Notch,
             target: EqNodeTarget::Both,
             channel: EqNodeChannel::Both,
@@ -825,6 +962,7 @@ mod tests {
     fn nodes_stack_additively_in_decibels() {
         let mut params = EqCurveParams::default();
         params.nodes[0] = EqNode {
+            enabled: true,
             node_type: EqNodeType::Bell,
             target: EqNodeTarget::Both,
             channel: EqNodeChannel::Both,
@@ -833,6 +971,7 @@ mod tests {
             q: 1.0,
         };
         params.nodes[1] = EqNode {
+            enabled: true,
             node_type: EqNodeType::Bell,
             target: EqNodeTarget::Both,
             channel: EqNodeChannel::Both,
@@ -854,6 +993,7 @@ mod tests {
         ] {
             let mut params = EqCurveParams::default();
             params.nodes[0] = EqNode {
+                enabled: true,
                 target,
                 ..bell(6.0)
             };
@@ -879,10 +1019,12 @@ mod tests {
         // with nothing overwritten to achieve it
         let mut params = EqCurveParams::default();
         params.nodes[0] = EqNode {
+            enabled: true,
             target: EqNodeTarget::Downwards,
             ..bell(6.0)
         };
         params.nodes[1] = EqNode {
+            enabled: true,
             target: EqNodeTarget::Upwards,
             ..bell(-9.0)
         };
@@ -906,6 +1048,7 @@ mod tests {
         ] {
             let mut params = EqCurveParams::default();
             params.nodes[0] = EqNode {
+                enabled: true,
                 channel,
                 ..bell(6.0)
             };
@@ -929,6 +1072,7 @@ mod tests {
     fn batched_and_single_evaluation_agree() {
         let mut params = EqCurveParams::default();
         params.nodes[0] = EqNode {
+            enabled: true,
             node_type: EqNodeType::Bell,
             target: EqNodeTarget::Both,
             channel: EqNodeChannel::Both,
@@ -937,6 +1081,7 @@ mod tests {
             q: 2.5,
         };
         params.nodes[1] = EqNode {
+            enabled: true,
             node_type: EqNodeType::HighShelf,
             target: EqNodeTarget::Both,
             channel: EqNodeChannel::Both,
@@ -945,6 +1090,7 @@ mod tests {
             q: 0.7,
         };
         params.nodes[2] = EqNode {
+            enabled: true,
             node_type: EqNodeType::LowCut24,
             target: EqNodeTarget::Both,
             channel: EqNodeChannel::Both,

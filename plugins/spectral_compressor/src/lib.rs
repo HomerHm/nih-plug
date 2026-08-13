@@ -53,6 +53,13 @@ const MAX_OVERLAP_ORDER: usize = 5;
 #[allow(dead_code)]
 const MAX_OVERLAP_TIMES: usize = 1 << MAX_OVERLAP_ORDER; // 32
 
+/// How long the bypass takes to fade in or out, in milliseconds.
+///
+/// Short enough to feel immediate, long enough that switching does not click. Bypassing swaps
+/// between two signals that are aligned in time but not identical, and a hard swap between those
+/// is a step.
+const BYPASS_FADE_MS: f32 = 15.0;
+
 /// This is a port of <https://github.com/robbert-vdh/spectral-compressor/>.
 pub struct SpectralCompressor {
     params: Arc<SpectralCompressorParams>,
@@ -93,6 +100,16 @@ pub struct SpectralCompressor {
     /// not parameters: a project that reopened mid-capture would be a nasty surprise.
     capture_active: Arc<AtomicBool>,
     capture_clear: Arc<AtomicBool>,
+
+    /// How far the bypass has faded in, from zero to one.
+    ///
+    /// Bypassing is done by pushing the dry/wet mix all the way dry rather than by skipping the
+    /// processing, so this rides on top of that parameter. See `process()` for why.
+    ///
+    /// Ramped by hand rather than with a [`Smoother`], which restarts its ramp on every
+    /// `set_target` call and so would approach its target without ever arriving. "Not quite
+    /// bypassed" is not bypassed: the mix has to reach exactly zero for the dry path to be exact.
+    bypass_amount: f32,
 }
 
 /// An FFT plan for a specific window size, all of which will be precomputed during initilaization.
@@ -159,6 +176,12 @@ pub enum StereoMode {
 /// Global parameters controlling the output stage and all compressors.
 #[derive(Params)]
 pub struct GlobalParams {
+    /// Whether the plugin passes its input through untouched.
+    ///
+    /// Hidden from the generic UI because it has its own button in the title bar, where a plugin
+    /// wide switch belongs. The host still sees it, and drives it from its own bypass control.
+    #[id = "bypass"]
+    pub bypass: BoolParam,
     /// Whether the two channels are compressed as left/right or as mid/side.
     #[id = "stereo_mode"]
     pub stereo_mode: EnumParam<StereoMode>,
@@ -241,6 +264,8 @@ impl Default for SpectralCompressor {
 
             capture_active: compressor_bank_capture_active,
             capture_clear: compressor_bank_capture_clear,
+
+            bypass_amount: 0.0,
         }
     }
 }
@@ -248,6 +273,12 @@ impl Default for SpectralCompressor {
 impl Default for GlobalParams {
     fn default() -> Self {
         GlobalParams {
+            // Marking it as the bypass parameter is what hooks it up to the host's own bypass
+            // control. NIH-plug only passes the flag along; the bypassing itself is ours to do,
+            // and it has to be, because this plugin reports latency.
+            bypass: BoolParam::new("Bypass", false)
+                .make_bypass()
+                .hide_in_generic_ui(),
             stereo_mode: EnumParam::new("Stereo Mode", StereoMode::LeftRight),
             // Defaults to fully independent, which is the behaviour this plugin has always had
             channel_link: FloatParam::new(
@@ -403,6 +434,8 @@ impl Plugin for SpectralCompressor {
                 capture_state: self.params.threshold.capture.state.clone(),
                 capturing: false,
                 selected_node: None,
+                node_solo: self.compressor_bank.node_solo.clone(),
+                soloed_node: None,
             },
         )
     }
@@ -464,6 +497,13 @@ impl Plugin for SpectralCompressor {
     fn reset(&mut self) {
         self.dry_wet_mixer.reset();
         self.compressor_bank.reset();
+        // Starting a bypassed plugin part way through the fade would let a moment of the processed
+        // signal through
+        self.bypass_amount = if self.params.global.bypass.value() {
+            1.0
+        } else {
+            0.0
+        };
     }
 
     fn process(
@@ -600,21 +640,52 @@ impl Plugin for SpectralCompressor {
             convert_mid_side(buffer);
         }
 
-        // Soloing happens last so it applies to what actually leaves the plugin, including the dry
-        // signal. Hearing the dry half of the other channel while soloing would defeat the point.
-        apply_solo(buffer, self.solo.load(), mid_side);
+        // Bypassing is done by pushing the mix all the way dry rather than by skipping the work
+        // above, for two reasons. The dry signal is already delayed to match the plugin's reported
+        // latency, so a fully dry output lines up with the host's delay compensation exactly --
+        // `mix_in_dry` copies it verbatim at a ratio of zero, so what comes out is the input, to
+        // the bit. And leaving the STFT running keeps its ring buffers current, so unbypassing does
+        // not spill up to a window of stale audio; it also leaves the analyzer and the capture
+        // working, which is what makes "bypass, capture a reference, unbypass" possible at all.
+        //
+        // The cost is that a bypassed plugin still does all the work. Skipping it would save that,
+        // but only by reintroducing the discontinuity above.
+        let bypass_target = if self.params.global.bypass.value() {
+            1.0
+        } else {
+            0.0
+        };
+        let bypass_start = self.bypass_amount;
+        let bypass_step = buffer.samples() as f32
+            / (BYPASS_FADE_MS / 1000.0 * self.buffer_config.sample_rate).max(1.0);
+        self.bypass_amount = if bypass_target > bypass_start {
+            (bypass_start + bypass_step).min(bypass_target)
+        } else {
+            (bypass_start - bypass_step).max(bypass_target)
+        };
 
+        // The mix is handed both ends of the block so the bypass fade happens per sample. The dry
+        // and wet halves are the same signal at the same moment in time but not the same numbers,
+        // and stepping between them once per block is a switch, not a fade.
+        let dry_wet_ratio = self
+            .params
+            .global
+            .dry_wet_ratio
+            .smoothed
+            .next_step(buffer.samples() as u32);
         self.dry_wet_mixer.mix_in_dry(
             buffer,
-            self.params
-                .global
-                .dry_wet_ratio
-                .smoothed
-                .next_step(buffer.samples() as u32),
+            dry_wet_ratio * (1.0 - bypass_start),
+            dry_wet_ratio * (1.0 - self.bypass_amount),
             // The dry and wet signals are in phase, so we can do a linear mix
             dry_wet_mixer::MixingStyle::Linear,
             self.stft.latency_samples() as usize,
         );
+
+        // Soloing is applied to what actually leaves the plugin, dry signal and all: hearing the
+        // dry half of the other channel through the mix would defeat the point. It fades out with
+        // the bypass, since a bypassed plugin has no business muting anything.
+        apply_solo(buffer, self.solo.load(), mid_side, self.bypass_amount);
 
         ProcessStatus::Normal
     }
@@ -652,12 +723,19 @@ impl SpectralCompressor {
 /// In mid/side the chains are not channels, so the buffer is converted, the unwanted half zeroed,
 /// and converted back. Soloing the mid then plays it from both speakers and soloing the side gives
 /// the usual out of phase pair, which is what those are supposed to sound like.
-fn apply_solo(buffer: &mut Buffer, solo: SoloMode, mid_side: bool) {
+///
+/// `muted_gain` is how much of the unwanted chain survives, which is the bypass fade. A bypassed
+/// plugin has to pass its input through untouched, and stepping the muted chain back to full at the
+/// end of that fade would put a click in exactly the signal that is supposed to be clean.
+fn apply_solo(buffer: &mut Buffer, solo: SoloMode, mid_side: bool, muted_gain: f32) {
     let muted_channel = match solo {
         SoloMode::Off => return,
         SoloMode::First => 1,
         SoloMode::Second => 0,
     };
+    if muted_gain >= 1.0 {
+        return;
+    }
 
     if mid_side {
         convert_mid_side(buffer);
@@ -665,7 +743,9 @@ fn apply_solo(buffer: &mut Buffer, solo: SoloMode, mid_side: bool) {
 
     let channels = buffer.as_slice();
     if let Some(channel) = channels.get_mut(muted_channel) {
-        channel.fill(0.0);
+        for sample in channel.iter_mut() {
+            *sample *= muted_gain;
+        }
     }
 
     if mid_side {

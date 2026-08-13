@@ -110,6 +110,11 @@ impl DryWetMixer {
     /// all-dry signal, and 1 results in an all-wet signal. This should be called at the start of
     /// the process function.
     ///
+    /// The ratio travels from `start_ratio` to `end_ratio` across the buffer. A bypass is a fade
+    /// between two signals that are aligned but not identical, and holding the ratio flat for a
+    /// whole buffer would turn that fade into a handful of steps at typical block sizes -- which is
+    /// a hard switch with extra ceremony. Pass the same value twice for a constant ratio.
+    ///
     /// # Panics
     ///
     /// Panics if the buffer is larger than the maximum block size, if the latency is larger than
@@ -117,19 +122,26 @@ impl DryWetMixer {
     pub fn mix_in_dry(
         &mut self,
         buffer: &mut Buffer,
-        ratio: f32,
+        start_ratio: f32,
+        end_ratio: f32,
         style: MixingStyle,
         latency: usize,
     ) {
-        if buffer.channels() == 0 {
+        if buffer.channels() == 0 || buffer.samples() == 0 {
             return;
         }
 
-        let ratio = ratio.clamp(0.0, 1.0);
-        if ratio == 1.0 {
+        let start_ratio = start_ratio.clamp(0.0, 1.0);
+        let end_ratio = end_ratio.clamp(0.0, 1.0);
+        if start_ratio == 1.0 && end_ratio == 1.0 {
             return;
         }
-        let (wet_t, dry_t) = match style {
+
+        // The ratio is stepped to its end value over the buffer, so the last sample lands exactly
+        // on `end_ratio`. That exactness is what lets a fully bypassed plugin take the verbatim
+        // copy below instead of multiplying by a number that is merely very close to one.
+        let ratio_step = (end_ratio - start_ratio) / buffer.samples() as f32;
+        let mix_at = |ratio: f32| match style {
             MixingStyle::Linear => (ratio, 1.0 - ratio),
             MixingStyle::EqualPower => (ratio.sqrt(), (1.0 - ratio).sqrt()),
         };
@@ -146,23 +158,28 @@ impl DryWetMixer {
 
         for (buffer_channel, delay_line) in buffer.as_slice().iter_mut().zip(self.delay_line.iter())
         {
-            if ratio == 0.0 {
+            if start_ratio == 0.0 && end_ratio == 0.0 {
                 buffer_channel[..num_samples_before_wrap].copy_from_slice(
                     &delay_line[read_position..read_position + num_samples_before_wrap],
                 );
                 buffer_channel[num_samples_before_wrap..]
                     .copy_from_slice(&delay_line[..num_samples_after_wrap]);
             } else {
+                let mut ratio = start_ratio;
                 for (buffer_sample, delay_sample) in buffer_channel[..num_samples_before_wrap]
                     .iter_mut()
                     .zip(&delay_line[read_position..read_position + num_samples_before_wrap])
                 {
+                    ratio += ratio_step;
+                    let (wet_t, dry_t) = mix_at(ratio);
                     *buffer_sample = (*buffer_sample * wet_t) + (delay_sample * dry_t);
                 }
                 for (buffer_sample, delay_sample) in buffer_channel[num_samples_before_wrap..]
                     .iter_mut()
                     .zip(&delay_line[..num_samples_after_wrap])
                 {
+                    ratio += ratio_step;
+                    let (wet_t, dry_t) = mix_at(ratio);
                     *buffer_sample = (*buffer_sample * wet_t) + (delay_sample * dry_t);
                 }
             }

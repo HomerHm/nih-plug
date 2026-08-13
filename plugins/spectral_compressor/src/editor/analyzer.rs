@@ -18,7 +18,7 @@ use atomic_float::AtomicF32;
 use nih_plug::nih_debug_assert;
 use nih_plug_vizia::vizia::prelude::*;
 use nih_plug_vizia::vizia::vg;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::{ChainMode, EditorEvent};
@@ -27,7 +27,9 @@ use crate::capture::{smooth_into, CaptureBlend};
 use crate::compressor_bank::{LF_BYPASS_FADE_OCTAVES, LF_BYPASS_OFF_HZ, NUM_CHAINS};
 use crate::curve::{Curve, CurveParams};
 use crate::eq_curve::CompressorDirection;
-use crate::eq_curve::{EqBankParams, EqCurve, EqCurveParams, EqNodeTarget, EqNodeType};
+use crate::eq_curve::{
+    soloed_index, EqBankParams, EqCurve, EqCurveParams, EqNodeTarget, EqNodeType,
+};
 use crate::SpectralCompressorParams;
 use nih_plug::prelude::{Enum, Param, ParamPtr};
 use nih_plug_vizia::widgets::RawParamEvent;
@@ -144,6 +146,12 @@ pub struct Analyzer<L, LSelected, LMode> {
     drag: Option<NodeDrag>,
     /// Which node the inspector below the graph is editing, so its handle can be marked.
     selected_node: LSelected,
+    /// Which node is being listened to on its own, shared with the audio thread.
+    ///
+    /// A plain atomic rather than a lens because it is read from deep inside the drawing and hit
+    /// testing, which run without a context to resolve a lens against. Toggling it always changes
+    /// the editor's own copy as well, so a redraw is guaranteed to follow.
+    node_solo: Arc<AtomicUsize>,
     /// The chain this graph draws, and the one every mouse event on it acts on.
     ///
     /// Baked in at build time rather than read from a lens: each graph is one chain, so clicking a
@@ -168,6 +176,20 @@ struct NodeDrag {
     start_cursor: (f32, f32),
 }
 
+/// Where one node's handle goes on a graph, as `[0, 1]` fractions of the analyzer's bounds.
+struct NodeHandle {
+    index: usize,
+    /// The line the handle sits on. A node applying to both gets one handle on each; they are the
+    /// same node, so dragging either moves both.
+    direction: CompressorDirection,
+    /// Whether the node currently deforms the curve, which is what tells a filled handle from a
+    /// hollow one. This already accounts for a solo elsewhere in the bank, not just the node's own
+    /// bypass, because the curve it would be drawn against does too.
+    active: bool,
+    t_x: f32,
+    t_y: f32,
+}
+
 impl<L, LSelected, LMode> Analyzer<L, LSelected, LMode>
 where
     L: Lens<Target = CompressorDirection>,
@@ -182,6 +204,7 @@ where
         params: LParams,
         edited_direction: L,
         selected_node: LSelected,
+        node_solo: Arc<AtomicUsize>,
         chain_idx: usize,
         chain_mode: LMode,
     ) -> Handle<'_, Self>
@@ -198,6 +221,7 @@ where
             edited_direction,
             drag: None,
             selected_node,
+            node_solo,
             chain_idx,
             chain_mode,
         }
@@ -214,17 +238,21 @@ where
         &self.params.threshold.eq
     }
 
-    /// Where a node's handle is drawn, as `[0, 1]` fractions of the analyzer's bounds. Mirrors
-    /// Where each active node's handle is drawn, as `[0, 1]` fractions of the analyzer's bounds.
+    /// The node being listened to on its own, if any. Every curve the editor builds goes through
+    /// this so that soloing shows the same thing it makes the compressors do.
+    fn soloed_node(&self) -> Option<usize> {
+        soloed_index(self.node_solo.load(Ordering::Relaxed))
+    }
+
+    /// Where each node's handle is drawn, as `[0, 1]` fractions of the analyzer's bounds.
     ///
     /// [`Self::draw_nodes()`] places the handles from this too, so hit testing and drawing cannot
     /// disagree about where a node is. Each line's composite curve is built once rather than once
     /// per node, which matters because this runs on every click and scroll.
-    fn node_positions_t(
-        &self,
-        chain_idx: usize,
-        chain_mode: ChainMode,
-    ) -> Vec<(usize, CompressorDirection, f32, f32)> {
+    ///
+    /// Bypassed nodes are included. A handle is how a node is found, so taking it away would leave
+    /// no way to switch one back on, and its position does not depend on whether it is active.
+    fn node_positions_t(&self, chain_idx: usize, chain_mode: ChainMode) -> Vec<NodeHandle> {
         let mut positions = Vec::new();
 
         // Both lines are collected, so a handle on the one that isn't focused can still be found.
@@ -238,7 +266,7 @@ where
 
         for direction in [CompressorDirection::Upwards, CompressorDirection::Downwards] {
             let (curve_params, eq_params, offset_db) =
-                curve_inputs(&self.params, chain_idx, direction);
+                curve_inputs(&self.params, self.soloed_node(), chain_idx, direction);
             let curve = Curve::new(&curve_params);
             let capture_blend = capture_smoothed.as_deref().map(|smoothed| {
                 capture_blend_for(
@@ -272,12 +300,13 @@ where
                     + node.handle_offset_db()
                     + offset_db;
 
-                positions.push((
+                positions.push(NodeHandle {
                     index,
                     direction,
-                    frequency_to_t(node.center_frequency),
-                    1.0 - db_to_unclamped_t(y_db),
-                ));
+                    active: node.enabled,
+                    t_x: frequency_to_t(node.center_frequency),
+                    t_y: 1.0 - db_to_unclamped_t(y_db),
+                });
             }
         }
 
@@ -307,16 +336,16 @@ where
         let radius = NODE_RADIUS * cx.scale_factor() * 2.0;
 
         let mut closest: Option<((usize, CompressorDirection), f32)> = None;
-        for (index, direction, t_x, t_y) in self.node_positions_t(chain_idx, chain_mode) {
-            let dx = (bounds.x + (bounds.w * t_x)) - x;
-            let dy = (bounds.y + (bounds.h * t_y)) - y;
+        for handle in self.node_positions_t(chain_idx, chain_mode) {
+            let dx = (bounds.x + (bounds.w * handle.t_x)) - x;
+            let dy = (bounds.y + (bounds.h * handle.t_y)) - y;
             let distance_squared = (dx * dx) + (dy * dy);
             if distance_squared > radius * radius {
                 continue;
             }
 
             if closest.is_none_or(|(_, best)| distance_squared < best) {
-                closest = Some(((index, direction), distance_squared));
+                closest = Some(((handle.index, handle.direction), distance_squared));
             }
         }
 
@@ -484,6 +513,10 @@ where
 
                     // The first click of this double click started a drag and selected the node
                     self.drag = None;
+                    // A solo pointing at a node that no longer exists would leave every curve empty
+                    if self.soloed_node() == Some(node_index) {
+                        cx.emit(EditorEvent::SetNodeSolo(None));
+                    }
                     cx.emit(EditorEvent::SelectNode(None));
                     cx.release();
                     cx.set_active(false);
@@ -507,7 +540,9 @@ where
                 set_param(cx, node.center_frequency.as_ptr(), frequency);
                 set_param(cx, node.gain_db.as_ptr(), 0.0);
                 // Deleting a node only switches its type off, so a reused slot would otherwise
-                // inherit whatever target it had before
+                // inherit whatever target it had before -- or worse, stay bypassed, which would
+                // hand back a node that does nothing and give no hint as to why
+                set_param(cx, node.enabled.as_ptr(), 1.0);
                 set_param(
                     cx,
                     node.target.as_ptr(),
@@ -736,8 +771,12 @@ where
 
         // Drawn at a full amount whatever the amount parameter says, so it answers "where would
         // this go if I pushed it all the way" even while the amount is turned down for an A/B
-        let (curve_params, _, offset_db) =
-            curve_inputs(&self.params, chain_idx, CompressorDirection::Downwards);
+        let (curve_params, _, offset_db) = curve_inputs(
+            &self.params,
+            self.soloed_node(),
+            chain_idx,
+            CompressorDirection::Downwards,
+        );
         let curve = Curve::new(&curve_params);
         let blend = capture_blend_for(&self.params, &curve_params, capture_smoothed, 1.0);
 
@@ -783,7 +822,7 @@ where
 
         for direction in [CompressorDirection::Upwards, CompressorDirection::Downwards] {
             let (curve_params, eq_params, offset_db) =
-                curve_inputs(&self.params, chain_idx, direction);
+                curve_inputs(&self.params, self.soloed_node(), chain_idx, direction);
             let curve = Curve::new(&curve_params);
             let eq_curve = EqCurve::new(&eq_params, direction, chain_idx);
             // The compressor bank folds the capture into its thresholds, so leaving it out here
@@ -860,43 +899,59 @@ where
         // Positions come from the same function hit testing uses, so the two cannot disagree about
         // where a node is. The focused line's handles go down last so they end up on top.
         let mut positions = self.node_positions_t(chain_idx, chain_mode);
-        positions.sort_by_key(|(_, direction, _, _)| *direction == edited_direction);
+        positions.sort_by_key(|handle| handle.direction == edited_direction);
 
         canvas.scissor(bounds.x, bounds.y, bounds.w, bounds.h);
-        for (index, direction, t_x, t_y) in positions {
-            if !(0.0..=1.0).contains(&t_x) {
+        for handle in positions {
+            if !(0.0..=1.0).contains(&handle.t_x) {
                 continue;
             }
 
             let color = curve_color(
-                match direction {
+                match handle.direction {
                     CompressorDirection::Upwards => UPWARDS_THRESHOLD_CURVE_COLOR,
                     CompressorDirection::Downwards => DOWNWARDS_THRESHOLD_CURVE_COLOR,
                 },
-                direction == edited_direction,
+                handle.direction == edited_direction,
             );
 
             // The selected node is drawn larger so it's obvious which one the inspector below the
             // graph is editing
-            let radius = if selected_node == Some(index) {
+            let radius = if selected_node == Some(handle.index) {
                 NODE_RADIUS * 1.6
             } else {
                 NODE_RADIUS
             };
 
-            let x = bounds.x + (bounds.w * t_x);
-            let y = bounds.y + (bounds.h * t_y);
+            let x = bounds.x + (bounds.w * handle.t_x);
+            let y = bounds.y + (bounds.h * handle.t_y);
             let mut path = vg::Path::new();
             path.circle(x, y, radius * scale_factor);
 
             // A filled center with a ring around it stays legible against both the dark background
-            // and the bright spectrum
-            canvas.fill_path(&path, &vg::Paint::color(color));
-            canvas.stroke_path(
-                &path,
-                &vg::Paint::color(vg::Color::rgbaf(0.05, 0.05, 0.05, 0.9))
-                    .with_line_width(1.5 * scale_factor),
-            );
+            // and the bright spectrum.
+            //
+            // A node that isn't deforming the curve is drawn as an outline instead. It has to stay
+            // visible -- it is still there, still draggable, and it is the only way back to
+            // switching it on -- but a filled handle would claim the curve passes through it, and
+            // the curve has already forgotten about it.
+            if handle.active {
+                canvas.fill_path(&path, &vg::Paint::color(color));
+                canvas.stroke_path(
+                    &path,
+                    &vg::Paint::color(vg::Color::rgbaf(0.05, 0.05, 0.05, 0.9))
+                        .with_line_width(1.5 * scale_factor),
+                );
+            } else {
+                canvas.fill_path(
+                    &path,
+                    &vg::Paint::color(vg::Color::rgbaf(0.05, 0.05, 0.05, 0.9)),
+                );
+                canvas.stroke_path(
+                    &path,
+                    &vg::Paint::color(color).with_line_width(1.5 * scale_factor),
+                );
+            }
         }
         canvas.reset_scissor();
     }
@@ -1131,6 +1186,7 @@ fn capture_blend_for<'a>(
 
 fn curve_inputs(
     params: &SpectralCompressorParams,
+    soloed_node: Option<usize>,
     chain_idx: usize,
     direction: CompressorDirection,
 ) -> (CurveParams, EqCurveParams, f32) {
@@ -1142,7 +1198,7 @@ fn curve_inputs(
 
     (
         params.threshold.curve_params(curve),
-        params.threshold.eq.snapshot(),
+        params.threshold.eq.snapshot(soloed_node),
         curve.threshold_offset_db.value(),
     )
 }
